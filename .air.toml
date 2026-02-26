@@ -1,0 +1,22 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/clicknest ./cmd/clicknest/"
+  bin = "./tmp/clicknest"
+  args_bin = ["-dev", "-addr", ":8080"]
+  include_ext = ["go"]
+  exclude_dir = ["web", "sdk", "tmp", "data", "cmd/clicknest/web_build", "cmd/clicknest/sdk_dist"]
+  delay = 500
+
+[log]
+  time = false
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  clean_on_exit = true

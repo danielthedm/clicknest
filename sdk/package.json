@@ -1,0 +1,22 @@
+{
+  "name": "@clicknest/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ClickNest analytics SDK with autocapture",
+  "main": "dist/clicknest.js",
+  "module": "dist/clicknest.esm.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^16.0.0",
+    "@rollup/plugin-terser": "^0.4.0",
+    "@rollup/plugin-typescript": "^12.0.0",
+    "rollup": "^4.0.0",
+    "tslib": "^2.8.0",
+    "typescript": "^5.7.0"
+  },
+  "files": ["dist/"]
+}

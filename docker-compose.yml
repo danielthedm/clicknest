@@ -1,0 +1,17 @@
+services:
+  clicknest:
+    image: ghcr.io/danielleslie/clicknest:latest
+    # To build from source instead of pulling a pre-built image:
+    # build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - clicknest-data:/data
+    restart: unless-stopped
+    environment:
+      # Optional — enables GitHub integration in Settings
+      # GITHUB_CLIENT_ID: your_client_id
+      # GITHUB_CLIENT_SECRET: your_client_secret
+
+volumes:
+  clicknest-data:

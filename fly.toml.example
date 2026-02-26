@@ -1,0 +1,35 @@
+# fly.toml — copy this to fly.toml and replace YOUR-APP-NAME before deploying.
+# See https://fly.io/docs/reference/configuration/ for details.
+#
+# Quickstart:
+#   cp fly.toml.example fly.toml
+#   fly launch --no-deploy        # sets app name + creates fly.toml overrides
+#   fly volumes create clicknest_data --size 1 --region <your-region>
+#   fly deploy
+
+app = 'YOUR-APP-NAME'
+primary_region = 'iad'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[[mounts]]
+  source = 'clicknest_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = 'requests'
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  memory = '256mb'   # stays within Fly's free tier (3 x 256mb machines included)
+  cpus = 1
+  memory_mb = 256
