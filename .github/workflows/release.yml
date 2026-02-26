@@ -134,7 +134,7 @@ jobs:
 
             **Docker (recommended):**
             ```bash
-            docker run -d -p 8080:8080 -v clicknest-data:/data ghcr.io/danielleslie/clicknest:${{ github.ref_name }}
+            docker run -d -p 8080:8080 -v clicknest-data:/data ghcr.io/danielthedm/clicknest:${{ github.ref_name }}
             ```
 
             **Binary (Linux/amd64):**
