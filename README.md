@@ -28,7 +28,7 @@ No manual instrumentation. No tagging every button. No ops overhead — ships as
 
 **Docker Compose (recommended):**
 ```bash
-curl -O https://raw.githubusercontent.com/danielleslie/clicknest/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/danielthedm/clicknest/main/docker-compose.yml
 docker compose up -d
 ```
 Open [http://localhost:8080](http://localhost:8080). Your API key is printed in the logs (`docker compose logs clicknest`).
@@ -36,11 +36,11 @@ Open [http://localhost:8080](http://localhost:8080). Your API key is printed in 
 **Pre-built binary:**
 ```bash
 # Linux (amd64)
-curl -L https://github.com/danielleslie/clicknest/releases/latest/download/clicknest_linux_amd64 -o clicknest
+curl -L https://github.com/danielthedm/clicknest/releases/latest/download/clicknest_linux_amd64 -o clicknest
 chmod +x clicknest && ./clicknest -data ./data
 
 # Linux (arm64 — Raspberry Pi, Hetzner ARM, etc.)
-curl -L https://github.com/danielleslie/clicknest/releases/latest/download/clicknest_linux_arm64 -o clicknest
+curl -L https://github.com/danielthedm/clicknest/releases/latest/download/clicknest_linux_arm64 -o clicknest
 chmod +x clicknest && ./clicknest -data ./data
 ```
 
@@ -126,7 +126,7 @@ DuckDB memory-maps data files, so RSS scales with query complexity, not total da
 
 ```bash
 # Download compose file
-curl -O https://raw.githubusercontent.com/danielleslie/clicknest/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/danielthedm/clicknest/main/docker-compose.yml
 
 # Start (runs in background, data persists in a Docker volume)
 docker compose up -d
@@ -147,7 +147,7 @@ GITHUB_CLIENT_ID=xxx GITHUB_CLIENT_SECRET=yyy docker compose up -d
 
 ```bash
 # Download binary
-curl -L https://github.com/danielleslie/clicknest/releases/latest/download/clicknest_linux_amd64 \
+curl -L https://github.com/danielthedm/clicknest/releases/latest/download/clicknest_linux_amd64 \
   -o /usr/local/bin/clicknest
 chmod +x /usr/local/bin/clicknest
 
