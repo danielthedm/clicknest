@@ -8,7 +8,7 @@ Thanks for your interest in contributing. This document covers how to get the pr
 
 ```bash
 # Clone and install dependencies
-git clone https://github.com/danielleslie/clicknest
+git clone https://github.com/danielthedm/clicknest
 cd clicknest
 
 # Install frontend + SDK dependencies

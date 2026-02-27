@@ -1,6 +1,6 @@
 services:
   clicknest:
-    image: ghcr.io/danielleslie/clicknest:latest
+    image: ghcr.io/danielthedm/clicknest:latest
     # To build from source instead of pulling a pre-built image:
     # build: .
     ports:
