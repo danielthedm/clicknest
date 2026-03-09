@@ -19,12 +19,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/ai"
-	"github.com/danielleslie/clicknest/internal/auth"
-	ghub "github.com/danielleslie/clicknest/internal/github"
-	"github.com/danielleslie/clicknest/internal/ingest"
-	"github.com/danielleslie/clicknest/internal/query"
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/ai"
+	"github.com/danielthedm/clicknest/internal/auth"
+	ghub "github.com/danielthedm/clicknest/internal/github"
+	"github.com/danielthedm/clicknest/internal/growth"
+	"github.com/danielthedm/clicknest/internal/ingest"
+	"github.com/danielthedm/clicknest/internal/query"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 type Config struct {
@@ -44,19 +45,21 @@ type Server struct {
 	namer    *ai.Namer
 	syncer   *ghub.Syncer
 	matcher  *ghub.Matcher
+	registry *growth.Registry
 	mux      *http.ServeMux
 	server   *http.Server
 }
 
-func New(config Config, events *storage.DuckDB, meta *storage.SQLite, namer *ai.Namer, syncer *ghub.Syncer, matcher *ghub.Matcher) *Server {
+func New(config Config, events *storage.DuckDB, meta *storage.SQLite, namer *ai.Namer, syncer *ghub.Syncer, matcher *ghub.Matcher, registry *growth.Registry) *Server {
 	s := &Server{
-		config:  config,
-		events:  events,
-		meta:    meta,
-		namer:   namer,
-		syncer:  syncer,
-		matcher: matcher,
-		mux:     http.NewServeMux(),
+		config:   config,
+		events:   events,
+		meta:     meta,
+		namer:    namer,
+		syncer:   syncer,
+		matcher:  matcher,
+		registry: registry,
+		mux:      http.NewServeMux(),
 	}
 	s.routes()
 	s.server = &http.Server{
@@ -72,6 +75,7 @@ func New(config Config, events *storage.DuckDB, meta *storage.SQLite, namer *ai.
 func (s *Server) routes() {
 	ingestHandler := ingest.NewHandler(s.events, s.namer)
 	queryHandler := query.NewHandler(s.events, s.meta)
+	queryHandler.SetMatcher(s.matcher)
 
 	apiKeyAuth := auth.APIKeyMiddleware(s.meta)
 	sessionAuth := auth.SessionMiddleware(s.meta)
@@ -125,6 +129,7 @@ func (s *Server) routes() {
 
 	// Project/settings endpoints.
 	s.mux.Handle("GET /api/v1/project", sessionAuth(http.HandlerFunc(s.projectHandler)))
+	s.mux.Handle("PUT /api/v1/project/description", sessionAuth(http.HandlerFunc(s.updateProjectDescriptionHandler)))
 	s.mux.Handle("GET /api/v1/llm/config", sessionAuth(http.HandlerFunc(s.getLLMConfigHandler)))
 	s.mux.Handle("PUT /api/v1/llm/config", sessionAuth(http.HandlerFunc(s.llmConfigHandler)))
 
@@ -133,7 +138,8 @@ func (s *Server) routes() {
 	s.mux.Handle("PUT /api/v1/github", sessionAuth(http.HandlerFunc(s.githubConnectHandler)))
 
 	// Errors.
-	s.mux.Handle("GET /api/v1/errors", sessionAuth(http.HandlerFunc(queryHandler.ErrorsHandler)))
+	s.mux.Handle("GET /api/v1/errors", sessionAuth(http.HandlerFunc(queryHandler.ErrorGroupsHandler)))
+	s.mux.Handle("GET /api/v1/errors/detail", sessionAuth(http.HandlerFunc(queryHandler.ErrorDetailHandler)))
 
 	// Feature flags.
 	s.mux.Handle("GET /api/v1/flags", sessionAuth(http.HandlerFunc(s.listFlagsHandler)))
@@ -154,6 +160,51 @@ func (s *Server) routes() {
 	// Heatmap.
 	s.mux.Handle("GET /api/v1/heatmap", sessionAuth(http.HandlerFunc(queryHandler.HeatmapHandler)))
 
+	// Attribution.
+	s.mux.Handle("GET /api/v1/attribution", sessionAuth(http.HandlerFunc(queryHandler.AttributionHandler)))
+	s.mux.Handle("GET /api/v1/attribution/sources", sessionAuth(http.HandlerFunc(queryHandler.AttributionSourcesHandler)))
+
+	// Ref codes.
+	s.mux.Handle("GET /api/v1/refcodes", sessionAuth(http.HandlerFunc(s.listRefCodesHandler)))
+	s.mux.Handle("POST /api/v1/refcodes", sessionAuth(http.HandlerFunc(s.createRefCodeHandler)))
+	s.mux.Handle("PUT /api/v1/refcodes/{id}", sessionAuth(http.HandlerFunc(s.updateRefCodeHandler)))
+	s.mux.Handle("DELETE /api/v1/refcodes/{id}", sessionAuth(http.HandlerFunc(s.deleteRefCodeHandler)))
+
+	// Lead scoring.
+	s.mux.Handle("GET /api/v1/leads", sessionAuth(http.HandlerFunc(queryHandler.LeadScoresHandler)))
+
+	// Scoring rules.
+	s.mux.Handle("GET /api/v1/scoring-rules", sessionAuth(http.HandlerFunc(s.listScoringRulesHandler)))
+	s.mux.Handle("POST /api/v1/scoring-rules", sessionAuth(http.HandlerFunc(s.createScoringRuleHandler)))
+	s.mux.Handle("PUT /api/v1/scoring-rules/{id}", sessionAuth(http.HandlerFunc(s.updateScoringRuleHandler)))
+	s.mux.Handle("DELETE /api/v1/scoring-rules/{id}", sessionAuth(http.HandlerFunc(s.deleteScoringRuleHandler)))
+
+	// CRM webhooks.
+	s.mux.Handle("GET /api/v1/crm-webhooks", sessionAuth(http.HandlerFunc(s.listCRMWebhooksHandler)))
+	s.mux.Handle("POST /api/v1/crm-webhooks", sessionAuth(http.HandlerFunc(s.createCRMWebhookHandler)))
+	s.mux.Handle("PUT /api/v1/crm-webhooks/{id}", sessionAuth(http.HandlerFunc(s.updateCRMWebhookHandler)))
+	s.mux.Handle("DELETE /api/v1/crm-webhooks/{id}", sessionAuth(http.HandlerFunc(s.deleteCRMWebhookHandler)))
+	s.mux.Handle("POST /api/v1/crm-webhooks/{id}/test", sessionAuth(http.HandlerFunc(s.testCRMWebhookHandler)))
+
+	// Connectors.
+	s.mux.Handle("GET /api/v1/connectors", sessionAuth(http.HandlerFunc(s.listConnectorsHandler)))
+	s.mux.Handle("POST /api/v1/connectors/{name}/post", sessionAuth(http.HandlerFunc(s.connectorPostHandler)))
+	s.mux.Handle("GET /api/v1/connectors/{name}/engagement/{externalID}", sessionAuth(http.HandlerFunc(s.connectorEngagementHandler)))
+	s.mux.Handle("GET /api/v1/connectors/{name}/validate", sessionAuth(http.HandlerFunc(s.connectorValidateHandler)))
+
+	// Campaigns.
+	s.mux.Handle("GET /api/v1/campaigns", sessionAuth(http.HandlerFunc(s.listCampaignsHandler)))
+	s.mux.Handle("POST /api/v1/campaigns", sessionAuth(http.HandlerFunc(s.createCampaignHandler)))
+	s.mux.Handle("GET /api/v1/campaigns/{id}", sessionAuth(http.HandlerFunc(s.getCampaignHandler)))
+	s.mux.Handle("PUT /api/v1/campaigns/{id}", sessionAuth(http.HandlerFunc(s.updateCampaignHandler)))
+	s.mux.Handle("DELETE /api/v1/campaigns/{id}", sessionAuth(http.HandlerFunc(s.deleteCampaignHandler)))
+	s.mux.Handle("POST /api/v1/campaigns/generate", sessionAuth(http.HandlerFunc(s.generateCampaignHandler)))
+	s.mux.Handle("POST /api/v1/campaigns/{id}/ab-test", sessionAuth(http.HandlerFunc(s.abTestHandler)))
+	s.mux.Handle("GET /api/v1/campaigns/{id}/ab-results", sessionAuth(http.HandlerFunc(queryHandler.ABResultsHandler)))
+
+	// ICP.
+	s.mux.Handle("POST /api/v1/icp/analyze", sessionAuth(http.HandlerFunc(s.icpAnalyzeHandler)))
+
 	// Backup / restore.
 	s.mux.Handle("GET /api/v1/export", sessionAuth(http.HandlerFunc(s.exportHandler)))
 	s.mux.Handle("POST /api/v1/import", sessionAuth(http.HandlerFunc(s.importHandler)))
@@ -172,6 +223,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/auth/login", s.loginHandler)
 	s.mux.HandleFunc("POST /api/v1/auth/logout", s.logoutHandler)
 	s.mux.Handle("GET /api/v1/auth/me", sessionAuth(http.HandlerFunc(s.meHandler)))
+	s.mux.Handle("PUT /api/v1/auth/project", sessionAuth(http.HandlerFunc(s.switchProjectHandler)))
+
+	// Multi-project management.
+	s.mux.Handle("GET /api/v1/projects", sessionAuth(http.HandlerFunc(s.listProjectsHandler)))
+	s.mux.Handle("POST /api/v1/projects", sessionAuth(http.HandlerFunc(s.createProjectHandler)))
+	s.mux.Handle("GET /api/v1/projects/{id}/members", sessionAuth(http.HandlerFunc(s.listMembersHandler)))
+	s.mux.Handle("POST /api/v1/projects/{id}/members", sessionAuth(http.HandlerFunc(s.addMemberHandler)))
+	s.mux.Handle("DELETE /api/v1/projects/{id}/members/{userID}", sessionAuth(http.HandlerFunc(s.removeMemberHandler)))
 
 	// Health check.
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +271,8 @@ func (s *Server) routes() {
 func (s *Server) Start() error {
 	log.Printf("ClickNest listening on %s", s.config.Addr)
 	s.startAlertChecker()
+	s.startLeadPusher()
+	s.startEngagementPoller()
 	return s.server.ListenAndServe()
 }
 
@@ -343,6 +404,27 @@ func (s *Server) projectHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(project)
+}
+
+func (s *Server) updateProjectDescriptionHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateProjectDescription(r.Context(), project.ID, body.Description); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) getLLMConfigHandler(w http.ResponseWriter, r *http.Request) {
@@ -511,7 +593,7 @@ func (s *Server) aiChatHandler(w http.ResponseWriter, r *http.Request) {
 	topPages, _ := s.events.QueryTopPages(r.Context(), project.ID, weekAgo, now, 10)
 	topEvents, _ := s.events.QueryTopEventNames(r.Context(), project.ID, monthAgo, now, 10)
 
-	systemMsg := buildAnalyticsSystemPrompt(trendData, topPages, topEvents)
+	systemMsg := buildAnalyticsSystemPrompt(project.Description, trendData, topPages, topEvents)
 
 	history := append(body.History, ai.ChatMessage{Role: "user", Content: body.Message})
 
@@ -526,12 +608,18 @@ func (s *Server) aiChatHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"reply": reply})
 }
 
-func buildAnalyticsSystemPrompt(trends []storage.TrendPoint, pages []storage.PageStat, events []storage.EventNameStat) string {
+func buildAnalyticsSystemPrompt(projectDescription string, trends []storage.TrendPoint, pages []storage.PageStat, events []storage.EventNameStat) string {
 	var b strings.Builder
 	b.WriteString("You are an analytics assistant embedded in ClickNest, a product analytics dashboard. ")
 	b.WriteString("You have access to real analytics data from the user's product. ")
 	b.WriteString("Be concise, direct, and actionable. Use plain paragraphs — no markdown headers or bullet lists unless explicitly asked. ")
 	b.WriteString("Focus on insights that help the user understand their product's performance and what to improve.\n\n")
+
+	if projectDescription != "" {
+		b.WriteString("ABOUT THIS PRODUCT:\n")
+		b.WriteString(projectDescription)
+		b.WriteString("\n\n")
+	}
 
 	if len(trends) > 0 {
 		total := int64(0)
@@ -1037,6 +1125,809 @@ func (s *Server) deleteAlertHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// --- Ref Code handlers ---
+
+func (s *Server) listRefCodesHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	codes, err := s.meta.ListRefCodes(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ref_codes": codes})
+}
+
+func (s *Server) createRefCodeHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Code  string `json:"code"`
+		Name  string `json:"name"`
+		Notes string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Code == "" || body.Name == "" {
+		http.Error(w, `{"error":"code and name are required"}`, http.StatusBadRequest)
+		return
+	}
+	id, err := generateID()
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	rc := storage.RefCode{
+		ID:        id,
+		ProjectID: project.ID,
+		Code:      body.Code,
+		Name:      body.Name,
+		Notes:     body.Notes,
+	}
+	if err := s.meta.CreateRefCode(r.Context(), rc); err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(rc)
+}
+
+func (s *Server) updateRefCodeHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Name  string `json:"name"`
+		Notes string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateRefCode(r.Context(), project.ID, id, body.Name, body.Notes); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) deleteRefCodeHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteRefCode(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Connector handlers ---
+
+func (s *Server) listConnectorsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	connectors := s.registry.List()
+	result := make([]map[string]string, len(connectors))
+	for i, c := range connectors {
+		result[i] = map[string]string{"name": c.Name(), "display_name": c.DisplayName()}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"connectors": result})
+}
+
+func (s *Server) connectorPostHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+	c := s.registry.Get(name)
+	if c == nil {
+		http.Error(w, `{"error":"connector not found"}`, http.StatusNotFound)
+		return
+	}
+	var body growth.PostContent
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	result, err := c.Post(r.Context(), body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"post failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func (s *Server) connectorEngagementHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+	externalID := r.PathValue("externalID")
+	c := s.registry.Get(name)
+	if c == nil {
+		http.Error(w, `{"error":"connector not found"}`, http.StatusNotFound)
+		return
+	}
+	metrics, err := c.FetchEngagement(r.Context(), externalID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"fetch failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+func (s *Server) connectorValidateHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+	c := s.registry.Get(name)
+	if c == nil {
+		http.Error(w, `{"error":"connector not found"}`, http.StatusNotFound)
+		return
+	}
+	if err := c.Validate(r.Context()); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"valid": false, "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"valid": true})
+}
+
+// --- Campaign handlers ---
+
+func (s *Server) listCampaignsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	campaigns, err := s.meta.ListCampaigns(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"campaigns": campaigns})
+}
+
+func (s *Server) createCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Name    string `json:"name"`
+		Channel string `json:"channel"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" || body.Channel == "" {
+		http.Error(w, `{"error":"name and channel are required"}`, http.StatusBadRequest)
+		return
+	}
+	id, err := generateID()
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if body.Content == "" {
+		body.Content = "{}"
+	}
+	c := storage.Campaign{
+		ID:        id,
+		ProjectID: project.ID,
+		Name:      body.Name,
+		Channel:   body.Channel,
+		Status:    "draft",
+		Content:   body.Content,
+	}
+	if err := s.meta.CreateCampaign(r.Context(), c); err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(c)
+}
+
+func (s *Server) getCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	c, err := s.meta.GetCampaign(r.Context(), project.ID, id)
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(c)
+}
+
+func (s *Server) updateCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateCampaign(r.Context(), project.ID, id, body.Name, body.Status, body.Content); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) deleteCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteCampaign(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) generateCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
+	if err != nil || cfg.Provider == "" {
+		http.Error(w, `{"error":"LLM not configured. Go to Settings to add an AI provider."}`, http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Channel string `json:"channel"`
+		Topic   string `json:"topic"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Channel == "" {
+		http.Error(w, `{"error":"channel is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC()
+	monthAgo := now.Add(-30 * 24 * time.Hour)
+	topPages, _ := s.events.QueryTopPages(r.Context(), project.ID, monthAgo, now, 10)
+	topEvents, _ := s.events.QueryTopEventNames(r.Context(), project.ID, monthAgo, now, 10)
+
+	// Auto-create a ref code for tracking.
+	refCodeID, _ := generateID()
+	refCode := fmt.Sprintf("campaign_%s", refCodeID[:8])
+	_ = s.meta.CreateRefCode(r.Context(), storage.RefCode{
+		ID:        refCodeID,
+		ProjectID: project.ID,
+		Code:      refCode,
+		Name:      fmt.Sprintf("Campaign: %s", body.Topic),
+	})
+
+	proj, _ := s.meta.GetProject(r.Context(), project.ID)
+	projectDesc := ""
+	if proj != nil {
+		projectDesc = proj.Description
+	}
+
+	cc := ai.CampaignContext{
+		ProjectDescription: projectDesc,
+		TopPages:           topPages,
+		TopEvents:          topEvents,
+		Channel:            body.Channel,
+		Topic:              body.Topic,
+		RefURL:             fmt.Sprintf("?ref=%s", refCode),
+	}
+
+	content, err := ai.GenerateCampaign(r.Context(), cfg, cc)
+	if err != nil {
+		log.Printf("ERROR campaign generation: %v", err)
+		http.Error(w, `{"error":"AI generation failed: `+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+
+	contentJSON, _ := json.Marshal(content)
+
+	campaignID, _ := generateID()
+	campaign := storage.Campaign{
+		ID:        campaignID,
+		ProjectID: project.ID,
+		Name:      content.Title,
+		Channel:   body.Channel,
+		RefCodeID: refCodeID,
+		Status:    "draft",
+		Content:   string(contentJSON),
+		AIPrompt:  body.Topic,
+	}
+	if err := s.meta.CreateCampaign(r.Context(), campaign); err != nil {
+		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"campaign":  campaign,
+		"content":   content,
+		"ref_code":  refCode,
+	})
+}
+
+func (s *Server) abTestHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
+	if err != nil || cfg.Provider == "" {
+		http.Error(w, `{"error":"LLM not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	campaignID := r.PathValue("id")
+	campaign, err := s.meta.GetCampaign(r.Context(), project.ID, campaignID)
+	if err != nil {
+		http.Error(w, `{"error":"campaign not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var original ai.CampaignContent
+	json.Unmarshal([]byte(campaign.Content), &original)
+
+	variations, err := ai.GenerateVariations(r.Context(), cfg, original, campaign.Channel, 2)
+	if err != nil {
+		log.Printf("ERROR A/B variation generation: %v", err)
+		http.Error(w, `{"error":"variation generation failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Create feature flags for each variation.
+	type variationWithFlag struct {
+		FlagKey string             `json:"flag_key"`
+		FlagID  string             `json:"flag_id"`
+		Content ai.CampaignContent `json:"content"`
+	}
+	var results []variationWithFlag
+
+	totalVariations := len(variations) + 1 // +1 for original
+	rollout := 100 / totalVariations
+
+	// Original gets a flag too.
+	origFlagID, _ := generateID()
+	origKey := fmt.Sprintf("ab_campaign_%s_original", campaignID[:8])
+	_ = s.meta.CreateFeatureFlag(r.Context(), storage.FeatureFlag{
+		ID:                origFlagID,
+		ProjectID:         project.ID,
+		Key:               origKey,
+		Name:              "A/B: Original",
+		Enabled:           true,
+		RolloutPercentage: rollout,
+	})
+	results = append(results, variationWithFlag{FlagKey: origKey, FlagID: origFlagID, Content: original})
+
+	for i, v := range variations {
+		flagID, _ := generateID()
+		key := fmt.Sprintf("ab_campaign_%s_v%d", campaignID[:8], i+1)
+		pct := rollout
+		if i == len(variations)-1 {
+			pct = 100 - rollout*totalVariations + rollout // ensure they sum to ~100
+		}
+		_ = s.meta.CreateFeatureFlag(r.Context(), storage.FeatureFlag{
+			ID:                flagID,
+			ProjectID:         project.ID,
+			Key:               key,
+			Name:              fmt.Sprintf("A/B: Variation %d", i+1),
+			Enabled:           true,
+			RolloutPercentage: pct,
+		})
+		results = append(results, variationWithFlag{FlagKey: key, FlagID: flagID, Content: v})
+	}
+
+	// Save variations back to campaign content.
+	updatedContent, _ := json.Marshal(map[string]any{
+		"original":   original,
+		"variations": results,
+	})
+	_ = s.meta.UpdateCampaign(r.Context(), project.ID, campaignID, campaign.Name, campaign.Status, string(updatedContent))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"variations": results})
+}
+
+// --- ICP handler ---
+
+func (s *Server) icpAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
+	if err != nil || cfg.Provider == "" {
+		http.Error(w, `{"error":"LLM not configured. Go to Settings to add an AI provider."}`, http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		ConversionPaths []string `json:"conversion_paths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.ConversionPaths) == 0 {
+		http.Error(w, `{"error":"conversion_paths is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC()
+	monthAgo := now.Add(-30 * 24 * time.Hour)
+
+	profiles, err := s.events.QueryICPProfiles(r.Context(), project.ID, body.ConversionPaths, monthAgo, now, 50)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to AI-compatible format.
+	aiProfiles := make([]ai.ICPProfile, len(profiles))
+	for i, p := range profiles {
+		aiProfiles[i] = ai.ICPProfile{
+			DistinctID:   p.DistinctID,
+			SessionCount: p.SessionCount,
+			EventCount:   p.EventCount,
+			TopPages:     p.TopPages,
+			EntrySource:  p.EntrySource,
+		}
+	}
+
+	proj, _ := s.meta.GetProject(r.Context(), project.ID)
+	projectDesc := ""
+	if proj != nil {
+		projectDesc = proj.Description
+	}
+
+	analysis, err := ai.AnalyzeICP(r.Context(), cfg, aiProfiles, projectDesc)
+	if err != nil {
+		log.Printf("ERROR ICP analysis: %v", err)
+		http.Error(w, `{"error":"AI analysis failed: `+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"analysis": analysis,
+		"profiles": profiles,
+	})
+}
+
+// --- Engagement poller ---
+
+func (s *Server) startEngagementPoller() {
+	ticker := time.NewTicker(30 * time.Minute)
+	go func() {
+		for range ticker.C {
+			s.pollEngagement(context.Background())
+		}
+	}()
+}
+
+func (s *Server) pollEngagement(ctx context.Context) {
+	projects, err := s.meta.ListProjects(ctx)
+	if err != nil {
+		log.Printf("WARN engagement poller: failed to list projects: %v", err)
+		return
+	}
+	for _, proj := range projects {
+		posts, err := s.meta.ListCampaignPosts(ctx, proj.ID)
+		if err != nil {
+			continue
+		}
+		for _, post := range posts {
+			c := s.registry.Get(post.ConnectorName)
+			if c == nil {
+				continue
+			}
+			metrics, err := c.FetchEngagement(ctx, post.ExternalID)
+			if err != nil {
+				log.Printf("WARN engagement poller: fetch failed for post %s: %v", post.ID, err)
+				continue
+			}
+			engJSON, _ := json.Marshal(metrics)
+			_ = s.meta.UpdateCampaignPostEngagement(ctx, post.ID, string(engJSON), time.Now().UTC())
+		}
+	}
+}
+
+// --- Scoring Rule handlers ---
+
+func (s *Server) listScoringRulesHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	rules, err := s.meta.ListScoringRules(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"rules": rules})
+}
+
+func (s *Server) createScoringRuleHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Name     string `json:"name"`
+		RuleType string `json:"rule_type"`
+		Config   string `json:"config"`
+		Points   int    `json:"points"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" || body.RuleType == "" {
+		http.Error(w, `{"error":"name and rule_type are required"}`, http.StatusBadRequest)
+		return
+	}
+	id, err := generateID()
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if body.Config == "" {
+		body.Config = "{}"
+	}
+	rule := storage.ScoringRule{
+		ID:        id,
+		ProjectID: project.ID,
+		Name:      body.Name,
+		RuleType:  body.RuleType,
+		Config:    body.Config,
+		Points:    body.Points,
+		Enabled:   true,
+	}
+	if err := s.meta.CreateScoringRule(r.Context(), rule); err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(rule)
+}
+
+func (s *Server) updateScoringRuleHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Name     string `json:"name"`
+		RuleType string `json:"rule_type"`
+		Config   string `json:"config"`
+		Points   int    `json:"points"`
+		Enabled  bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateScoringRule(r.Context(), project.ID, id, body.Name, body.RuleType, body.Config, body.Points, body.Enabled); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) deleteScoringRuleHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteScoringRule(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- CRM Webhook handlers ---
+
+func (s *Server) listCRMWebhooksHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	webhooks, err := s.meta.ListCRMWebhooks(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"webhooks": webhooks})
+}
+
+func (s *Server) createCRMWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Name       string `json:"name"`
+		WebhookURL string `json:"webhook_url"`
+		MinScore   int    `json:"min_score"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" || body.WebhookURL == "" {
+		http.Error(w, `{"error":"name and webhook_url are required"}`, http.StatusBadRequest)
+		return
+	}
+	id, err := generateID()
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	wh := storage.CRMWebhook{
+		ID:         id,
+		ProjectID:  project.ID,
+		Name:       body.Name,
+		WebhookURL: body.WebhookURL,
+		MinScore:   body.MinScore,
+		Enabled:    true,
+	}
+	if err := s.meta.CreateCRMWebhook(r.Context(), wh); err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(wh)
+}
+
+func (s *Server) updateCRMWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Name       string `json:"name"`
+		WebhookURL string `json:"webhook_url"`
+		MinScore   int    `json:"min_score"`
+		Enabled    bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateCRMWebhook(r.Context(), project.ID, id, body.Name, body.WebhookURL, body.MinScore, body.Enabled); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) deleteCRMWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteCRMWebhook(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) testCRMWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	_ = r.PathValue("id")
+
+	samplePayload, _ := json.Marshal(map[string]any{
+		"test":       true,
+		"project_id": project.ID,
+		"leads": []map[string]any{
+			{
+				"distinct_id":   "test-user@example.com",
+				"score":         85,
+				"event_count":   42,
+				"session_count": 7,
+			},
+		},
+	})
+
+	// Get the webhook to find the URL.
+	webhooks, err := s.meta.ListCRMWebhooks(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	whID := r.PathValue("id")
+	var targetURL string
+	for _, wh := range webhooks {
+		if wh.ID == whID {
+			targetURL = wh.WebhookURL
+			break
+		}
+	}
+	if targetURL == "" {
+		http.Error(w, `{"error":"webhook not found"}`, http.StatusNotFound)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(samplePayload))
+	if err != nil {
+		http.Error(w, `{"error":"failed to build request"}`, http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"webhook delivery failed: %s"}`, err.Error()), http.StatusBadGateway)
+		return
+	}
+	resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok", "http_status": resp.StatusCode})
+}
+
 // --- Alert checker ---
 
 func (s *Server) startAlertChecker() {
@@ -1103,6 +1994,70 @@ func (s *Server) checkAlerts(ctx context.Context) {
 		now := time.Now().UTC()
 		if err := s.meta.UpdateAlertTriggered(ctx, a.ID, now); err != nil {
 			log.Printf("WARN alert checker: failed to update last_triggered_at: %v", err)
+		}
+	}
+}
+
+// --- Lead pusher ---
+
+func (s *Server) startLeadPusher() {
+	ticker := time.NewTicker(15 * time.Minute)
+	go func() {
+		for range ticker.C {
+			s.pushLeads(context.Background())
+		}
+	}()
+}
+
+func (s *Server) pushLeads(ctx context.Context) {
+	webhooks, err := s.meta.ListAllEnabledCRMWebhooks(ctx)
+	if err != nil {
+		log.Printf("WARN lead pusher: failed to list webhooks: %v", err)
+		return
+	}
+	for _, wh := range webhooks {
+		rules, err := s.meta.ListScoringRules(ctx, wh.ProjectID)
+		if err != nil {
+			log.Printf("WARN lead pusher: failed to load rules for project %s: %v", wh.ProjectID, err)
+			continue
+		}
+		now := time.Now().UTC()
+		start := now.Add(-30 * 24 * time.Hour)
+		leads, _, err := s.events.QueryLeadScores(ctx, wh.ProjectID, rules, start, now, 100, 0)
+		if err != nil {
+			log.Printf("WARN lead pusher: failed to query leads for project %s: %v", wh.ProjectID, err)
+			continue
+		}
+		// Filter by min score.
+		var qualified []storage.ScoredLead
+		for _, l := range leads {
+			if l.Score >= wh.MinScore {
+				qualified = append(qualified, l)
+			}
+		}
+		if len(qualified) == 0 {
+			continue
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"project_id": wh.ProjectID,
+			"webhook":    wh.Name,
+			"leads":      qualified,
+		})
+		req, err := http.NewRequestWithContext(ctx, "POST", wh.WebhookURL, bytes.NewReader(payload))
+		if err != nil {
+			log.Printf("WARN lead pusher: failed to build request for webhook %s: %v", wh.Name, err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("WARN lead pusher: webhook %s delivery failed: %v", wh.Name, err)
+		} else {
+			resp.Body.Close()
+			log.Printf("INFO lead pusher: pushed %d leads to webhook %s", len(qualified), wh.Name)
+		}
+		if err := s.meta.UpdateCRMWebhookPushed(ctx, wh.ID, now); err != nil {
+			log.Printf("WARN lead pusher: failed to update last_pushed_at: %v", err)
 		}
 	}
 }

@@ -100,14 +100,18 @@ func (o *OpenAI) GenerateEventName(ctx context.Context, req NamingRequest) (*Nam
 	}, nil
 }
 
-const systemPrompt = `You are an analytics event naming assistant. Given DOM context about a user interaction (element tag, id, classes, text, aria labels, page URL), generate a short, human-readable event name that describes what the user did.
+const systemPrompt = `You name analytics events. Given DOM context about a user interaction, output a short action name.
 
 Rules:
-- Use the format: "User [action] '[element description]' on [page/section]"
-- Keep names under 80 characters
-- Be specific but concise
-- Use the visible text, aria-label, or id to identify the element
-- Only output the event name, nothing else`
+- Use Title Case, 2-5 words max (e.g. "Toggle Pending Suggestions", "Click Company: Meta", "Open Website Link")
+- DO NOT start with "User clicked", "User viewed", or any subject prefix
+- For clicks: start with the action verb (Click, Toggle, Open, Select, Expand, Close, Submit)
+- For navigation/links: "Open [target]" or "Click [label] Link"
+- For toggles/switches: "Toggle [label]"
+- Include the element's visible text or aria-label as the object
+- Do NOT include the page name or URL — keep it element-focused
+- If the element text is a proper noun or entity name, include it (e.g. "Click Company: Meta")
+- Only output the name, nothing else`
 
 func buildPrompt(req NamingRequest) string {
 	var b strings.Builder

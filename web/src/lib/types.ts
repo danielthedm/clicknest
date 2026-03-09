@@ -52,6 +52,7 @@ export interface EventName {
 export interface Project {
 	id: string;
 	name: string;
+	description: string;
 	api_key: string;
 	created_at: string;
 }
@@ -189,10 +190,151 @@ export interface HeatmapPoint {
 	count: number;
 }
 
+export interface ErrorGroup {
+	message: string;
+	error_type: string;
+	count: number;
+	users: number;
+	sessions: number;
+	first_seen: string;
+	last_seen: string;
+	sample_id: string;
+	sparkline: TrendPoint[];
+}
+
+export interface SourceLink {
+	file_path: string;
+	github_url: string;
+	line: number;
+}
+
 export interface StorageInfo {
 	events_bytes: number;
 	meta_bytes: number;
 	total_bytes: number;
 	volume_bytes: number;
 	free_bytes: number;
+}
+
+export interface AttributionSource {
+	source: string;
+	channel: string;
+	sessions: number;
+	users: number;
+	bounced: number;
+	avg_pages: number;
+}
+
+export interface ChannelSummary {
+	channel: string;
+	sessions: number;
+	users: number;
+	bounced: number;
+}
+
+export interface RefCode {
+	id: string;
+	project_id: string;
+	code: string;
+	name: string;
+	notes: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ScoringRule {
+	id: string;
+	project_id: string;
+	name: string;
+	rule_type: string;
+	config: string;
+	points: number;
+	enabled: boolean;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ScoredLead {
+	distinct_id: string;
+	score: number;
+	event_count: number;
+	session_count: number;
+	page_views: number;
+	first_seen: string;
+	last_seen: string;
+	top_pages?: string[];
+	properties?: Record<string, unknown>;
+}
+
+export interface CRMWebhook {
+	id: string;
+	project_id: string;
+	name: string;
+	webhook_url: string;
+	min_score: number;
+	enabled: boolean;
+	last_pushed_at?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface Campaign {
+	id: string;
+	project_id: string;
+	name: string;
+	channel: string;
+	ref_code_id?: string;
+	status: string;
+	content: string;
+	ai_prompt: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface CampaignContent {
+	title: string;
+	body: string;
+	url?: string;
+	tags?: string[];
+}
+
+export interface ConnectorInfo {
+	name: string;
+	display_name: string;
+}
+
+export interface ICPAnalysis {
+	summary: string;
+	common_traits: string[];
+	best_channels: string[];
+	recommendations: string[];
+}
+
+export interface ICPUserProfile {
+	distinct_id: string;
+	session_count: number;
+	event_count: number;
+	top_pages: string[];
+	entry_source: string;
+}
+
+export interface ABVariation {
+	flag_key: string;
+	content: string;
+	impressions: number;
+	conversions: number;
+	conversion_rate: number;
+}
+
+export interface ProjectMember {
+	user_id: string;
+	project_id: string;
+	role: string;
+	created_at: string;
+}
+
+export interface MeResponse {
+	user_id: string;
+	active_project?: { id: string; name: string };
+	projects: { id: string; name: string }[];
 }

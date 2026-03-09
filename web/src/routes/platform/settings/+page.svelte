@@ -1,11 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getProject, getLLMConfig, updateLLMConfig, getGitHub, connectGitHub, getGitHubOAuthURL, exportBackupURL, importBackup, getStorage } from '$lib/api';
+	import { getProject, getLLMConfig, updateLLMConfig, getGitHub, connectGitHub, getGitHubOAuthURL, exportBackupURL, importBackup, getStorage, updateProjectDescription } from '$lib/api';
 	import type { Project, GitHubConnection, StorageInfo } from '$lib/types';
 
 	let project = $state<Project | null>(null);
 	let loading = $state(true);
 	let copied = $state(false);
+	let projectDescription = $state('');
+	let descSaving = $state(false);
+	let descSaved = $state(false);
 
 	let llmProvider = $state('openai');
 	let llmApiKey = $state('');
@@ -61,6 +64,7 @@
 			const [proj, gh, llm, stor] = await Promise.all([getProject(), getGitHub(), getLLMConfig(), getStorage()]);
 			storage = stor;
 			project = proj;
+			projectDescription = proj.description || '';
 			github = gh;
 			if (gh.connected) {
 				ghOwner = gh.repo_owner ?? '';
@@ -96,6 +100,18 @@
 		}
 		loading = false;
 	});
+
+	async function saveDescription() {
+		descSaving = true;
+		try {
+			await updateProjectDescription(projectDescription);
+			descSaved = true;
+			setTimeout(() => { descSaved = false; }, 2000);
+		} catch (e) {
+			console.error('Failed to save description:', e);
+		}
+		descSaving = false;
+	}
 
 	function copyApiKey() {
 		if (!project) return;
@@ -196,6 +212,35 @@
 						>
 							{copied ? 'Copied!' : 'Copy'}
 						</button>
+					</div>
+				</div>
+				<div>
+					<label for="proj-desc" class="text-xs text-muted-foreground block mb-1">
+						App Description
+						<span class="text-muted-foreground/60 ml-1">(used for AI Insights context)</span>
+					</label>
+					<textarea
+						id="proj-desc"
+						bind:value={projectDescription}
+						rows="3"
+						placeholder="e.g. B2B SaaS for project management. Key pages: /pricing, /signup, /dashboard. Main goal is converting free trials to paid."
+						class="w-full px-3 py-2 text-sm border border-border rounded-md bg-background resize-y"
+					></textarea>
+					<div class="flex items-center gap-2 mt-2">
+						<button
+							onclick={saveDescription}
+							disabled={descSaving}
+							class="px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+						>
+							{#if descSaving}
+								Saving...
+							{:else if descSaved}
+								Saved!
+							{:else}
+								Save Description
+							{/if}
+						</button>
+						<span class="text-xs text-muted-foreground">Helps AI give relevant, product-aware insights</span>
 					</div>
 				</div>
 			</div>

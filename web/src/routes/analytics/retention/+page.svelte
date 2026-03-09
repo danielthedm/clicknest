@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { getRetention } from '$lib/api';
 	import type { RetentionCohort } from '$lib/types';
+	import AiInsight from '$lib/components/ui/AiInsight.svelte';
 
 	let cohorts = $state<RetentionCohort[]>([]);
 	let loading = $state(true);
@@ -46,6 +47,17 @@
 		if (cohort.size === 0 || !cohort.retention[periodIdx]) return 0;
 		return Math.round((cohort.retention[periodIdx] / cohort.size) * 100);
 	}
+
+	let retentionPrompt = $derived(() => {
+		if (cohorts.length === 0) return '';
+		const rows = cohorts.slice(0, 8).map(c => {
+			const pcts = c.retention.map((v, i) => `${interval} ${i}: ${c.size > 0 ? Math.round((v / c.size) * 100) : 0}%`).join(', ');
+			return `${c.cohort} (${c.size} users): ${pcts}`;
+		}).join('\n');
+		return `Analyze this ${interval}ly retention data (${range} window, ${periods} periods). Give 2-3 brief, actionable insights about user retention trends, which cohorts are strongest/weakest, and what might improve retention.\n\n${rows}`;
+	});
+
+	let retentionReady = $derived(!loading && cohorts.length > 0);
 
 	function cellColor(pct: number): string {
 		if (pct === 0) return 'background: hsl(215 20% 95%)';
@@ -103,6 +115,8 @@
 			{/each}
 		</div>
 	</div>
+
+	<AiInsight cacheKey="retention_{interval}_{range}_{periods}" prompt={retentionPrompt()} ready={retentionReady} />
 
 	<!-- Retention table -->
 	<div class="border border-border rounded-lg bg-card overflow-x-auto">

@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/auth"
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // ListFunnelsHandler handles GET /api/v1/funnels.

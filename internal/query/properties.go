@@ -5,7 +5,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/danielleslie/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/auth"
 )
 
 // PropertyKeysHandler handles GET /api/v1/properties/keys.

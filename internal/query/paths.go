@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/auth"
 )
 
 // PathsHandler handles GET /api/v1/paths — page transition flow analysis.

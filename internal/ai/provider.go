@@ -3,7 +3,7 @@ package ai
 import (
 	"context"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // NamingRequest contains the context needed to generate an event name.

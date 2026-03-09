@@ -2,12 +2,31 @@ const DISTINCT_KEY = '_cn_distinct';
 
 let currentDistinctId: string | null = null;
 
-export function getDistinctId(): string | null {
+function generateId(): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let id = '';
+  const array = new Uint8Array(16);
+  crypto.getRandomValues(array);
+  for (const byte of array) {
+    id += chars[byte % chars.length];
+  }
+  return id;
+}
+
+export function getDistinctId(): string {
   if (currentDistinctId) return currentDistinctId;
   try {
-    return localStorage.getItem(DISTINCT_KEY);
+    const stored = localStorage.getItem(DISTINCT_KEY);
+    if (stored) return stored;
+    // Auto-generate an anonymous ID so every visitor is tracked.
+    const anonId = generateId();
+    localStorage.setItem(DISTINCT_KEY, anonId);
+    return anonId;
   } catch {
-    return null;
+    // localStorage not available — return a transient ID.
+    const transient = generateId();
+    currentDistinctId = transient;
+    return transient;
   }
 }
 

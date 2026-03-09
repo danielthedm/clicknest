@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // Cache wraps the SQLite event_names table for fast fingerprint → name lookups.

@@ -5,7 +5,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // SourceMatcher finds source code for DOM elements (optional, used when GitHub is connected).

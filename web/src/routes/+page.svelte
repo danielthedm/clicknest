@@ -70,7 +70,40 @@
 		return () => cleanup?.();
 	});
 
-	async function loadInitialInsight() {
+	const INSIGHT_CACHE_KEY = 'clicknest_insight_cache';
+	const INSIGHT_TTL = 10 * 60 * 1000; // 10 minutes
+
+	function getCachedInsight(): string | null {
+		try {
+			const raw = sessionStorage.getItem(INSIGHT_CACHE_KEY);
+			if (!raw) return null;
+			const { reply, ts } = JSON.parse(raw);
+			if (Date.now() - ts > INSIGHT_TTL) return null;
+			return reply;
+		} catch {
+			return null;
+		}
+	}
+
+	function setCachedInsight(reply: string) {
+		try {
+			sessionStorage.setItem(INSIGHT_CACHE_KEY, JSON.stringify({ reply, ts: Date.now() }));
+		} catch { /* ignore */ }
+	}
+
+	async function loadInitialInsight(force = false) {
+		if (!force) {
+			const cached = getCachedInsight();
+			if (cached) {
+				chatEnabled = true;
+				chatHistory = [
+					{ role: 'user', content: 'Analyze my analytics data' },
+					{ role: 'assistant', content: cached },
+				];
+				return;
+			}
+		}
+
 		chatLoading = true;
 		chatEnabled = true;
 		try {
@@ -83,10 +116,11 @@
 				{ role: 'assistant', content: res.reply },
 			];
 			chatError = '';
+			setCachedInsight(res.reply);
 		} catch (e: any) {
 			const msg = e.message || '';
 			if (msg.includes('LLM not configured')) {
-				chatEnabled = false; // Silently hide the chat panel
+				chatEnabled = false;
 			} else {
 				chatError = msg.replace('API error 500: ', '').replace(/^{"error":"/, '').replace(/"}$/, '');
 			}
@@ -182,7 +216,7 @@
 	let showChat = $derived(chatEnabled || chatLoading);
 </script>
 
-<div class="p-6 max-w-6xl">
+<div class="p-6 max-w-6xl h-full overflow-y-auto">
 	<div class="mb-6">
 		<h2 class="text-2xl font-bold tracking-tight">Overview</h2>
 		<p class="text-sm text-muted-foreground mt-1">What's happening today</p>
@@ -305,6 +339,18 @@
 					{#if chatLoading}
 						<span class="text-xs text-muted-foreground animate-pulse ml-1">Analyzing...</span>
 					{/if}
+					<div class="ml-auto">
+						<button
+							onclick={() => loadInitialInsight(true)}
+							disabled={chatLoading}
+							class="p-1 rounded hover:bg-accent transition-colors disabled:opacity-50"
+							title="Refresh insights"
+						>
+							<svg class="w-3.5 h-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" class:animate-spin={chatLoading}>
+								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+							</svg>
+						</button>
+					</div>
 				</div>
 
 				<!-- Chat messages -->

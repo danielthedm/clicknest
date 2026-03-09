@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/auth"
 )
 
 // PagesHandler handles GET /api/v1/pages — top pages by traffic.

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // ChatMessage is a single message in a chat conversation.

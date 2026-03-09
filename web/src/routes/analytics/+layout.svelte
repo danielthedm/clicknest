@@ -7,6 +7,7 @@
 		{ href: '/analytics/pages', label: 'Pages' },
 		{ href: '/analytics/trends', label: 'Trends' },
 		{ href: '/analytics/retention', label: 'Retention' },
+		{ href: '/analytics/attribution', label: 'Attribution' },
 	];
 </script>
 

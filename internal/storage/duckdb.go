@@ -1033,6 +1033,126 @@ func (d *DuckDB) QueryHeatmap(ctx context.Context, projectID, urlPath string, st
 	return points, rows.Err()
 }
 
+type ErrorGroup struct {
+	Message   string       `json:"message"`
+	ErrorType string       `json:"error_type"`
+	Count     int          `json:"count"`
+	Users     int          `json:"users"`
+	Sessions  int          `json:"sessions"`
+	FirstSeen time.Time    `json:"first_seen"`
+	LastSeen  time.Time    `json:"last_seen"`
+	SampleID  string       `json:"sample_id"`
+	Sparkline []TrendPoint `json:"sparkline"`
+}
+
+func (d *DuckDB) QueryErrorGroups(ctx context.Context, projectID string, start, end time.Time, limit int) ([]ErrorGroup, int, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT
+			COALESCE(json_extract_string(properties, '$.message'), 'Unknown error') AS message,
+			CASE
+				WHEN json_extract_string(properties, '$.error_type') IS NOT NULL
+					AND json_extract_string(properties, '$.error_type') != ''
+					THEN json_extract_string(properties, '$.error_type')
+				WHEN COALESCE(json_extract_string(properties, '$.message'), '') LIKE 'TypeError:%' THEN 'TypeError'
+				WHEN COALESCE(json_extract_string(properties, '$.message'), '') LIKE 'ReferenceError:%' THEN 'ReferenceError'
+				WHEN COALESCE(json_extract_string(properties, '$.message'), '') LIKE 'SyntaxError:%' THEN 'SyntaxError'
+				WHEN COALESCE(json_extract_string(properties, '$.message'), '') LIKE 'RangeError:%' THEN 'RangeError'
+				WHEN COALESCE(json_extract_string(properties, '$.message'), '') LIKE 'URIError:%' THEN 'URIError'
+				WHEN COALESCE(json_extract_string(properties, '$.message'), '') LIKE 'EvalError:%' THEN 'EvalError'
+				WHEN json_extract_string(properties, '$.type') = 'unhandledrejection' THEN 'UnhandledRejection'
+				ELSE 'Error'
+			END AS error_type,
+			COUNT(*) AS count,
+			COUNT(DISTINCT CASE WHEN distinct_id IS NOT NULL AND distinct_id != '' THEN distinct_id END) AS users,
+			COUNT(DISTINCT session_id) AS sessions,
+			MIN(timestamp) AS first_seen,
+			MAX(timestamp) AS last_seen,
+			FIRST(id) AS sample_id
+		FROM events
+		WHERE project_id = ? AND event_type = 'error'
+			AND timestamp >= ? AND timestamp <= ?
+		GROUP BY message, error_type
+		ORDER BY count DESC
+		LIMIT ?
+	`, projectID, start, end, limit)
+	if err != nil {
+		return nil, 0, fmt.Errorf("querying error groups: %w", err)
+	}
+	defer rows.Close()
+
+	var groups []ErrorGroup
+	for rows.Next() {
+		var g ErrorGroup
+		if err := rows.Scan(&g.Message, &g.ErrorType, &g.Count, &g.Users, &g.Sessions, &g.FirstSeen, &g.LastSeen, &g.SampleID); err != nil {
+			return nil, 0, fmt.Errorf("scanning error group: %w", err)
+		}
+		groups = append(groups, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	// Get total count of all error events in range.
+	var total int
+	err = d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE project_id = ? AND event_type = 'error' AND timestamp >= ? AND timestamp <= ?`,
+		projectID, start, end,
+	).Scan(&total)
+	if err != nil {
+		return groups, 0, fmt.Errorf("counting errors: %w", err)
+	}
+
+	return groups, total, nil
+}
+
+func (d *DuckDB) QueryErrorTrends(ctx context.Context, projectID string, start, end time.Time, messages []string) (map[string][]TrendPoint, error) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(messages))
+	args := []any{projectID, start, end}
+	for i, m := range messages {
+		placeholders[i] = "?"
+		args = append(args, m)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(json_extract_string(properties, '$.message'), 'Unknown error') AS message,
+			CAST(date_trunc('day', CAST(timestamp AS TIMESTAMP)) AS VARCHAR) AS bucket,
+			COUNT(*) AS count
+		FROM events
+		WHERE project_id = ? AND event_type = 'error'
+			AND timestamp >= ? AND timestamp <= ?
+			AND COALESCE(json_extract_string(properties, '$.message'), 'Unknown error') IN (%s)
+		GROUP BY message, bucket
+		ORDER BY message, bucket
+	`, strings.Join(placeholders, ", "))
+
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying error trends: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string][]TrendPoint)
+	for rows.Next() {
+		var msg, bucket string
+		var count int64
+		if err := rows.Scan(&msg, &bucket, &count); err != nil {
+			return nil, fmt.Errorf("scanning error trend: %w", err)
+		}
+		result[msg] = append(result[msg], TrendPoint{Bucket: bucket, Count: count})
+	}
+
+	return result, rows.Err()
+}
+
 func (d *DuckDB) CountEvents(ctx context.Context, projectID, eventType, eventName string, since time.Time) (int64, error) {
 	query := "SELECT COUNT(*) FROM events WHERE project_id = ?"
 	args := []any{projectID}

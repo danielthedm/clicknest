@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // SuggestedFunnel is a funnel definition proposed by the LLM.

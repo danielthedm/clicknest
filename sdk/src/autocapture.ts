@@ -71,6 +71,10 @@ function handleClick(e: MouseEvent): void {
 }
 
 function handleError(e: ErrorEvent): void {
+  const errorType = e.error?.constructor?.name
+    || extractErrorType(e.message)
+    || 'Error';
+
   enqueue({
     event_type: 'error',
     url: window.location.href,
@@ -83,12 +87,17 @@ function handleError(e: ErrorEvent): void {
       lineno: e.lineno,
       colno: e.colno,
       stack: (e.error as Error | null)?.stack,
+      error_type: errorType,
     },
   });
 }
 
 function handleRejection(e: PromiseRejectionEvent): void {
   const msg = e.reason instanceof Error ? e.reason.message : String(e.reason);
+  const errorType = e.reason instanceof Error
+    ? (e.reason.constructor.name || extractErrorType(msg) || 'UnhandledRejection')
+    : 'UnhandledRejection';
+
   enqueue({
     event_type: 'error',
     url: window.location.href,
@@ -99,8 +108,14 @@ function handleRejection(e: PromiseRejectionEvent): void {
       message: msg,
       stack: (e.reason as Error | null)?.stack,
       type: 'unhandledrejection',
+      error_type: errorType,
     },
   });
+}
+
+function extractErrorType(message: string): string | null {
+  const match = message.match(/^(\w+Error):/);
+  return match ? match[1] : null;
 }
 
 function handleSubmit(e: SubmitEvent): void {
@@ -167,6 +182,8 @@ function getUtmParams(): Record<string, string> {
     const val = params.get(key);
     if (val) utms[key] = val;
   }
+  const ref = params.get('ref');
+  if (ref) utms['ref'] = ref;
   return utms;
 }
 

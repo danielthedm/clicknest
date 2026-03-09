@@ -11,10 +11,11 @@ import (
 )
 
 type Project struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	APIKey    string    `json:"api_key"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	APIKey      string    `json:"api_key"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type EventName struct {
@@ -95,8 +96,8 @@ func (s *SQLite) CreateProject(ctx context.Context, id, name string) (*Project, 
 func (s *SQLite) GetProject(ctx context.Context, id string) (*Project, error) {
 	var p Project
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, api_key, created_at FROM projects WHERE id = ?`, id,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.CreatedAt)
+		`SELECT id, name, description, api_key, created_at FROM projects WHERE id = ?`, id,
+	).Scan(&p.ID, &p.Name, &p.Description, &p.APIKey, &p.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -106,8 +107,8 @@ func (s *SQLite) GetProject(ctx context.Context, id string) (*Project, error) {
 func (s *SQLite) GetProjectByAPIKey(ctx context.Context, apiKey string) (*Project, error) {
 	var p Project
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, api_key, created_at FROM projects WHERE api_key = ?`, apiKey,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.CreatedAt)
+		`SELECT id, name, description, api_key, created_at FROM projects WHERE api_key = ?`, apiKey,
+	).Scan(&p.ID, &p.Name, &p.Description, &p.APIKey, &p.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +116,7 @@ func (s *SQLite) GetProjectByAPIKey(ctx context.Context, apiKey string) (*Projec
 }
 
 func (s *SQLite) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, api_key, created_at FROM projects ORDER BY created_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, api_key, created_at FROM projects ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -124,12 +125,20 @@ func (s *SQLite) ListProjects(ctx context.Context) ([]Project, error) {
 	var projects []Project
 	for rows.Next() {
 		var p Project
-		if err := rows.Scan(&p.ID, &p.Name, &p.APIKey, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.APIKey, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		projects = append(projects, p)
 	}
 	return projects, rows.Err()
+}
+
+func (s *SQLite) UpdateProjectDescription(ctx context.Context, id, description string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET description = ? WHERE id = ?`,
+		description, id,
+	)
+	return err
 }
 
 // --- Event Names ---
@@ -617,6 +626,429 @@ func (s *SQLite) UpdateAlertTriggered(ctx context.Context, id string, t time.Tim
 	return err
 }
 
+// --- Ref Codes ---
+
+type RefCode struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"project_id"`
+	Code      string    `json:"code"`
+	Name      string    `json:"name"`
+	Notes     string    `json:"notes"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (s *SQLite) CreateRefCode(ctx context.Context, rc RefCode) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO ref_codes (id, project_id, code, name, notes) VALUES (?, ?, ?, ?, ?)`,
+		rc.ID, rc.ProjectID, rc.Code, rc.Name, rc.Notes,
+	)
+	return err
+}
+
+func (s *SQLite) ListRefCodes(ctx context.Context, projectID string) ([]RefCode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, code, name, notes, created_at, updated_at
+		 FROM ref_codes WHERE project_id = ? ORDER BY created_at DESC`,
+		projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var codes []RefCode
+	for rows.Next() {
+		var rc RefCode
+		if err := rows.Scan(&rc.ID, &rc.ProjectID, &rc.Code, &rc.Name, &rc.Notes, &rc.CreatedAt, &rc.UpdatedAt); err != nil {
+			return nil, err
+		}
+		codes = append(codes, rc)
+	}
+	return codes, rows.Err()
+}
+
+func (s *SQLite) UpdateRefCode(ctx context.Context, projectID, id, name, notes string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE ref_codes SET name = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND id = ?`,
+		name, notes, projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) DeleteRefCode(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM ref_codes WHERE project_id = ? AND id = ?`,
+		projectID, id,
+	)
+	return err
+}
+
+// --- Scoring Rules ---
+
+type ScoringRule struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"project_id"`
+	Name      string    `json:"name"`
+	RuleType  string    `json:"rule_type"`
+	Config    string    `json:"config"`
+	Points    int       `json:"points"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (s *SQLite) CreateScoringRule(ctx context.Context, r ScoringRule) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO scoring_rules (id, project_id, name, rule_type, config, points, enabled) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.ProjectID, r.Name, r.RuleType, r.Config, r.Points, b2i(r.Enabled),
+	)
+	return err
+}
+
+func (s *SQLite) ListScoringRules(ctx context.Context, projectID string) ([]ScoringRule, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, name, rule_type, config, points, enabled, created_at, updated_at
+		 FROM scoring_rules WHERE project_id = ? ORDER BY created_at DESC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []ScoringRule
+	for rows.Next() {
+		var r ScoringRule
+		var enabledInt int
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Name, &r.RuleType, &r.Config, &r.Points, &enabledInt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabledInt != 0
+		rules = append(rules, r)
+	}
+	return rules, rows.Err()
+}
+
+func (s *SQLite) UpdateScoringRule(ctx context.Context, projectID, id string, name, ruleType, config string, points int, enabled bool) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE scoring_rules SET name = ?, rule_type = ?, config = ?, points = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE project_id = ? AND id = ?`,
+		name, ruleType, config, points, b2i(enabled), projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) DeleteScoringRule(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM scoring_rules WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
+}
+
+// --- CRM Webhooks ---
+
+type CRMWebhook struct {
+	ID           string     `json:"id"`
+	ProjectID    string     `json:"project_id"`
+	Name         string     `json:"name"`
+	WebhookURL   string     `json:"webhook_url"`
+	MinScore     int        `json:"min_score"`
+	Enabled      bool       `json:"enabled"`
+	LastPushedAt *time.Time `json:"last_pushed_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+func (s *SQLite) CreateCRMWebhook(ctx context.Context, w CRMWebhook) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO crm_webhooks (id, project_id, name, webhook_url, min_score, enabled) VALUES (?, ?, ?, ?, ?, ?)`,
+		w.ID, w.ProjectID, w.Name, w.WebhookURL, w.MinScore, b2i(w.Enabled),
+	)
+	return err
+}
+
+func (s *SQLite) ListCRMWebhooks(ctx context.Context, projectID string) ([]CRMWebhook, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, name, webhook_url, min_score, enabled, last_pushed_at, created_at, updated_at
+		 FROM crm_webhooks WHERE project_id = ? ORDER BY created_at DESC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var webhooks []CRMWebhook
+	for rows.Next() {
+		var wh CRMWebhook
+		var enabledInt int
+		if err := rows.Scan(&wh.ID, &wh.ProjectID, &wh.Name, &wh.WebhookURL, &wh.MinScore, &enabledInt, &wh.LastPushedAt, &wh.CreatedAt, &wh.UpdatedAt); err != nil {
+			return nil, err
+		}
+		wh.Enabled = enabledInt != 0
+		webhooks = append(webhooks, wh)
+	}
+	return webhooks, rows.Err()
+}
+
+func (s *SQLite) ListAllEnabledCRMWebhooks(ctx context.Context) ([]CRMWebhook, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, name, webhook_url, min_score, enabled, last_pushed_at, created_at, updated_at
+		 FROM crm_webhooks WHERE enabled = 1 ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var webhooks []CRMWebhook
+	for rows.Next() {
+		var wh CRMWebhook
+		var enabledInt int
+		if err := rows.Scan(&wh.ID, &wh.ProjectID, &wh.Name, &wh.WebhookURL, &wh.MinScore, &enabledInt, &wh.LastPushedAt, &wh.CreatedAt, &wh.UpdatedAt); err != nil {
+			return nil, err
+		}
+		wh.Enabled = enabledInt != 0
+		webhooks = append(webhooks, wh)
+	}
+	return webhooks, rows.Err()
+}
+
+func (s *SQLite) UpdateCRMWebhook(ctx context.Context, projectID, id string, name, webhookURL string, minScore int, enabled bool) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE crm_webhooks SET name = ?, webhook_url = ?, min_score = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE project_id = ? AND id = ?`,
+		name, webhookURL, minScore, b2i(enabled), projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) UpdateCRMWebhookPushed(ctx context.Context, id string, t time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE crm_webhooks SET last_pushed_at = ? WHERE id = ?`, t, id,
+	)
+	return err
+}
+
+func (s *SQLite) DeleteCRMWebhook(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM crm_webhooks WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
+}
+
+// --- Campaigns ---
+
+type Campaign struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"project_id"`
+	Name      string    `json:"name"`
+	Channel   string    `json:"channel"`
+	RefCodeID string    `json:"ref_code_id,omitempty"`
+	Status    string    `json:"status"`
+	Content   string    `json:"content"`
+	AIPrompt  string    `json:"ai_prompt"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (s *SQLite) CreateCampaign(ctx context.Context, c Campaign) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO campaigns (id, project_id, name, channel, ref_code_id, status, content, ai_prompt)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ProjectID, c.Name, c.Channel, c.RefCodeID, c.Status, c.Content, c.AIPrompt,
+	)
+	return err
+}
+
+func (s *SQLite) ListCampaigns(ctx context.Context, projectID string) ([]Campaign, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, name, channel, COALESCE(ref_code_id, ''), status, content, ai_prompt, created_at, updated_at
+		 FROM campaigns WHERE project_id = ? ORDER BY created_at DESC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var campaigns []Campaign
+	for rows.Next() {
+		var c Campaign
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Channel, &c.RefCodeID, &c.Status, &c.Content, &c.AIPrompt, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		campaigns = append(campaigns, c)
+	}
+	return campaigns, rows.Err()
+}
+
+func (s *SQLite) GetCampaign(ctx context.Context, projectID, id string) (*Campaign, error) {
+	var c Campaign
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, name, channel, COALESCE(ref_code_id, ''), status, content, ai_prompt, created_at, updated_at
+		 FROM campaigns WHERE project_id = ? AND id = ?`, projectID, id,
+	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Channel, &c.RefCodeID, &c.Status, &c.Content, &c.AIPrompt, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *SQLite) UpdateCampaign(ctx context.Context, projectID, id, name, status, content string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE campaigns SET name = ?, status = ?, content = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE project_id = ? AND id = ?`,
+		name, status, content, projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) DeleteCampaign(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM campaigns WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
+}
+
+// --- Campaign Posts ---
+
+type CampaignPost struct {
+	ID             string     `json:"id"`
+	CampaignID     string     `json:"campaign_id"`
+	ProjectID      string     `json:"project_id"`
+	ConnectorName  string     `json:"connector_name"`
+	ExternalID     string     `json:"external_id"`
+	ExternalURL    string     `json:"external_url"`
+	PostedAt       time.Time  `json:"posted_at"`
+	LastEngagement string     `json:"last_engagement"`
+	LastFetchedAt  *time.Time `json:"last_fetched_at,omitempty"`
+}
+
+func (s *SQLite) CreateCampaignPost(ctx context.Context, cp CampaignPost) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO campaign_posts (id, campaign_id, project_id, connector_name, external_id, external_url, last_engagement)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		cp.ID, cp.CampaignID, cp.ProjectID, cp.ConnectorName, cp.ExternalID, cp.ExternalURL, cp.LastEngagement,
+	)
+	return err
+}
+
+func (s *SQLite) ListCampaignPosts(ctx context.Context, projectID string) ([]CampaignPost, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, campaign_id, project_id, connector_name, external_id, external_url, posted_at, last_engagement, last_fetched_at
+		 FROM campaign_posts WHERE project_id = ? ORDER BY posted_at DESC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var posts []CampaignPost
+	for rows.Next() {
+		var cp CampaignPost
+		if err := rows.Scan(&cp.ID, &cp.CampaignID, &cp.ProjectID, &cp.ConnectorName, &cp.ExternalID, &cp.ExternalURL, &cp.PostedAt, &cp.LastEngagement, &cp.LastFetchedAt); err != nil {
+			return nil, err
+		}
+		posts = append(posts, cp)
+	}
+	return posts, rows.Err()
+}
+
+func (s *SQLite) UpdateCampaignPostEngagement(ctx context.Context, id, engagement string, fetchedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE campaign_posts SET last_engagement = ?, last_fetched_at = ? WHERE id = ?`,
+		engagement, fetchedAt, id,
+	)
+	return err
+}
+
+// --- Project Members ---
+
+type ProjectMember struct {
+	UserID    string    `json:"user_id"`
+	ProjectID string    `json:"project_id"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (s *SQLite) AddProjectMember(ctx context.Context, userID, projectID, role string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO project_members (user_id, project_id, role) VALUES (?, ?, ?)`,
+		userID, projectID, role,
+	)
+	return err
+}
+
+func (s *SQLite) RemoveProjectMember(ctx context.Context, userID, projectID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM project_members WHERE user_id = ? AND project_id = ?`,
+		userID, projectID,
+	)
+	return err
+}
+
+func (s *SQLite) ListProjectMembers(ctx context.Context, projectID string) ([]ProjectMember, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT user_id, project_id, role, created_at FROM project_members WHERE project_id = ? ORDER BY created_at`,
+		projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []ProjectMember
+	for rows.Next() {
+		var m ProjectMember
+		if err := rows.Scan(&m.UserID, &m.ProjectID, &m.Role, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, rows.Err()
+}
+
+func (s *SQLite) ListUserProjects(ctx context.Context, userID string) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT p.id, p.name, p.description, p.api_key, p.created_at
+		 FROM projects p
+		 JOIN project_members pm ON pm.project_id = p.id
+		 WHERE pm.user_id = ?
+		 ORDER BY p.created_at`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var projects []Project
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.APIKey, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		projects = append(projects, p)
+	}
+	return projects, rows.Err()
+}
+
+func (s *SQLite) GetUserProjectRole(ctx context.Context, userID, projectID string) (string, error) {
+	var role string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT role FROM project_members WHERE user_id = ? AND project_id = ?`,
+		userID, projectID,
+	).Scan(&role)
+	return role, err
+}
+
+func (s *SQLite) SwitchSessionProject(ctx context.Context, token, projectID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE user_sessions SET project_id = ? WHERE token = ?`,
+		projectID, token,
+	)
+	return err
+}
+
 func (s *SQLite) Close() error {
 	return s.db.Close()
 }
@@ -657,30 +1089,32 @@ func (s *SQLite) GetUserByEmail(ctx context.Context, email string) (*User, error
 	return u, nil
 }
 
-func (s *SQLite) CreateUserSession(ctx context.Context, userID string, expires time.Time) (string, error) {
+func (s *SQLite) CreateUserSession(ctx context.Context, userID string, expires time.Time, projectID string) (string, error) {
 	token, err := generateRandomHex(32)
 	if err != nil {
 		return "", err
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO user_sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)`,
-		token, userID, expires, time.Now().UTC())
+		`INSERT INTO user_sessions (token, user_id, expires_at, created_at, project_id) VALUES (?, ?, ?, ?, ?)`,
+		token, userID, expires, time.Now().UTC(), projectID)
 	return token, err
 }
 
-func (s *SQLite) GetUserSession(ctx context.Context, token string) (string, error) {
+// GetUserSession returns (userID, projectID, error). projectID may be empty for legacy sessions.
+func (s *SQLite) GetUserSession(ctx context.Context, token string) (string, string, error) {
 	var userID string
+	var projectID sql.NullString
 	var expiresAt time.Time
 	err := s.db.QueryRowContext(ctx,
-		`SELECT user_id, expires_at FROM user_sessions WHERE token = ?`, token).
-		Scan(&userID, &expiresAt)
+		`SELECT user_id, expires_at, project_id FROM user_sessions WHERE token = ?`, token).
+		Scan(&userID, &expiresAt, &projectID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if time.Now().UTC().After(expiresAt) {
-		return "", sql.ErrNoRows
+		return "", "", sql.ErrNoRows
 	}
-	return userID, nil
+	return userID, projectID.String, nil
 }
 
 func (s *SQLite) DeleteUserSession(ctx context.Context, token string) error {

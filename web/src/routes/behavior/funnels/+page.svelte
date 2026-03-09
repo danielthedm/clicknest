@@ -3,6 +3,7 @@
 	import { listFunnels, createFunnel, deleteFunnel, getFunnelResults, getFunnelCohorts, suggestFunnels, getNames } from '$lib/api';
 	import type { Funnel, FunnelStep, FunnelResult, FunnelCohortResult, SuggestedFunnel, EventName } from '$lib/types';
 	import { relativeTime } from '$lib/utils';
+	import AiInsight from '$lib/components/ui/AiInsight.svelte';
 
 	let funnels = $state<Funnel[]>([]);
 	let selectedFunnel = $state<Funnel | null>(null);
@@ -214,6 +215,14 @@
 		return '';
 	}
 
+	let funnelInsightPrompt = $derived(() => {
+		if (!selectedFunnel || results.length === 0) return '';
+		const steps = results.map((r, i) => `Step ${i + 1} "${r.step}": ${r.count} users${i > 0 ? ` (${conversionRate(i)} from prev)` : ''}`).join('\n');
+		return `Analyze this conversion funnel "${selectedFunnel.name}" (${range} window). Give 2-3 brief, actionable insights about drop-offs and what to improve.\n\n${steps}\n\nOverall conversion: ${overallRate()}`;
+	});
+
+	let funnelInsightReady = $derived(!loadingResults && results.length > 0 && !!selectedFunnel);
+
 	function formatCohortLabel(cohort: string): string {
 		try {
 			const d = new Date(cohort);
@@ -350,6 +359,10 @@
 				</div>
 			</div>
 		</div>
+	{/if}
+
+	{#if funnelInsightReady}
+		<AiInsight cacheKey="funnels_{selectedFunnel?.id}_{range}" prompt={funnelInsightPrompt()} ready={funnelInsightReady} />
 	{/if}
 
 	<div class="grid grid-cols-[1fr_1.5fr] gap-4">

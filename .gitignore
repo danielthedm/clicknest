@@ -27,6 +27,9 @@ fly.toml
 .claude/
 CLAUDE.md
 
+# Internal docs
+PRODUCT_IDEAS.md
+
 # OS
 .DS_Store
 *.swp
