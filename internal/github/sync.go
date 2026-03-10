@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 var componentExtensions = map[string]bool{
@@ -17,6 +17,9 @@ var componentExtensions = map[string]bool{
 	".svelte": true,
 	".html":   true,
 	".astro":  true,
+	".js":     true,
+	".ts":     true,
+	".mjs":    true,
 }
 
 // re-patterns for extracting selectors from source code

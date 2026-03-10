@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/auth"
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // EventsHandler handles GET /api/v1/events — list events with filters.

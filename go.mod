@@ -1,4 +1,4 @@
-module github.com/danielleslie/clicknest
+module github.com/danielthedm/clicknest
 
 go 1.25.7
 

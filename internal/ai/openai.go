@@ -100,14 +100,18 @@ func (o *OpenAI) GenerateEventName(ctx context.Context, req NamingRequest) (*Nam
 	}, nil
 }
 
-const systemPrompt = `You are an analytics event naming assistant. Given DOM context about a user interaction (element tag, id, classes, text, aria labels, page URL), generate a short, human-readable event name that describes what the user did.
+const systemPrompt = `You name analytics events. Given DOM context about a user interaction, output a short action name that describes the element's role — not its specific content.
 
 Rules:
-- Use the format: "User [action] '[element description]' on [page/section]"
-- Keep names under 80 characters
-- Be specific but concise
-- Use the visible text, aria-label, or id to identify the element
-- Only output the event name, nothing else`
+- Use Title Case, 2-5 words max
+- DO NOT start with "User clicked", "User viewed", or any subject prefix
+- For clicks: start with the action verb (Click, Toggle, Open, Select, Expand, Close, Submit)
+- For navigation/links: "Open [target type]" or "Click [label] Link"
+- For toggles/switches: "Toggle [label]"
+- Use DOM structure (classes, IDs, parent path, aria-label) to infer the element's role
+- The element text is provided for context to understand element purpose — do NOT embed specific content values, entity names, or user-generated text into the name. These are stored separately as event attributes.
+- Do NOT include the page name or URL
+- Only output the name, nothing else`
 
 func buildPrompt(req NamingRequest) string {
 	var b strings.Builder
@@ -123,7 +127,7 @@ func buildPrompt(req NamingRequest) string {
 		fmt.Fprintf(&b, "Classes: %s\n", req.ElementClasses)
 	}
 	if req.ElementText != "" {
-		fmt.Fprintf(&b, "Text: %s\n", req.ElementText)
+		fmt.Fprintf(&b, "Text (for context only — do NOT embed in name): %s\n", req.ElementText)
 	}
 	if req.AriaLabel != "" {
 		fmt.Fprintf(&b, "Aria Label: %s\n", req.AriaLabel)

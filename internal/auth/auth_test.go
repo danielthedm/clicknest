@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 func TestProjectFromContext_Miss(t *testing.T) {
@@ -41,5 +41,29 @@ func TestValidateAPIKey_EmptyKey(t *testing.T) {
 	_, err := ValidateAPIKey(context.Background(), nil, "")
 	if err != ErrUnauthorized {
 		t.Fatalf("expected ErrUnauthorized for empty key, got: %v", err)
+	}
+}
+
+func TestUserIDFromContext_Miss(t *testing.T) {
+	id := UserIDFromContext(context.Background())
+	if id != "" {
+		t.Fatalf("expected empty string for empty context, got %q", id)
+	}
+}
+
+func TestUserIDFromContext_Hit(t *testing.T) {
+	ctx := WithUserID(context.Background(), "user-123")
+	got := UserIDFromContext(ctx)
+	if got != "user-123" {
+		t.Fatalf("expected user ID %q, got %q", "user-123", got)
+	}
+}
+
+func TestWithUserID_DoesNotMutateParent(t *testing.T) {
+	parent := context.Background()
+	_ = WithUserID(parent, "user-123")
+
+	if id := UserIDFromContext(parent); id != "" {
+		t.Fatal("WithUserID should not mutate the parent context")
 	}
 }

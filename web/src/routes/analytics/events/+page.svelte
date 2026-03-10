@@ -185,6 +185,27 @@
 	});
 
 	let maxStatCount = $derived(stats.length > 0 ? stats[0].count : 1);
+
+	// Group consecutive events with the same display name + type
+	interface GroupedEvent {
+		event: Event;
+		count: number;
+		latest: string;
+	}
+
+	let groupedEvents = $derived<GroupedEvent[]>(() => {
+		const groups: GroupedEvent[] = [];
+		for (const e of events) {
+			const name = eventDisplayName(e);
+			const last = groups[groups.length - 1];
+			if (last && eventDisplayName(last.event) === name && last.event.event_type === e.event_type && last.event.url_path === e.url_path) {
+				last.count++;
+			} else {
+				groups.push({ event: e, count: 1, latest: e.timestamp });
+			}
+		}
+		return groups;
+	});
 </script>
 
 <div class="p-6 max-w-6xl">
@@ -340,7 +361,8 @@
 					{:else if events.length === 0}
 						<tr><td colspan="5" class="px-4 py-8 text-center text-muted-foreground">No events found</td></tr>
 					{:else}
-						{#each events as event}
+						{#each groupedEvents() as group}
+							{@const event = group.event}
 							<tr
 								class="hover:bg-accent/50 transition-colors {event.properties && Object.keys(event.properties).length > 0 ? 'cursor-pointer' : ''}"
 								onclick={() => { if (event.properties && Object.keys(event.properties).length > 0) expandedRow = expandedRow === event.id ? null : event.id; }}
@@ -355,7 +377,7 @@
 									</span>
 								</td>
 								<td class="px-4 py-2.5 max-w-xs truncate {event.event_name ? 'font-medium' : 'text-muted-foreground'}">
-									{eventDisplayName(event)}
+									{eventDisplayName(event)}{#if group.count > 1}<span class="ml-1.5 text-xs text-muted-foreground font-normal">x{group.count}</span>{/if}
 								</td>
 								<td class="px-4 py-2.5 text-muted-foreground truncate max-w-[200px]">{event.url_path}</td>
 								<td class="px-4 py-2.5">

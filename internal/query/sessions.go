@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/auth"
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // SessionsHandler handles GET /api/v1/sessions — list sessions.

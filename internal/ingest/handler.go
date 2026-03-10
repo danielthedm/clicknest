@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/ai"
-	"github.com/danielleslie/clicknest/internal/auth"
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/ai"
+	"github.com/danielthedm/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 type IngestEvent struct {

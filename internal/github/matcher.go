@@ -3,10 +3,20 @@ package github
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
+	"path"
 	"strings"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
+
+// SourceLink represents a link to a source file on GitHub.
+type SourceLink struct {
+	FilePath  string `json:"file_path"`
+	GitHubURL string `json:"github_url"`
+	Line      int    `json:"line"`
+}
 
 // SourceMatch represents a matched source file for a DOM element.
 type SourceMatch struct {
@@ -92,6 +102,89 @@ func (m *Matcher) Match(ctx context.Context, projectID string, elementID, elemen
 		return nil, nil
 	}
 	return bestMatch, nil
+}
+
+// MatchSourceFile attempts to find a source file in the indexed repo that matches
+// the given error source URL and line number, returning a GitHub link if found.
+func (m *Matcher) MatchSourceFile(ctx context.Context, projectID, sourceURL string, lineno int) (*SourceLink, error) {
+	if sourceURL == "" {
+		return nil, nil
+	}
+
+	// Parse filename from URL.
+	parsed, err := url.Parse(sourceURL)
+	if err != nil {
+		return nil, nil
+	}
+	filename := path.Base(parsed.Path)
+	if filename == "" || filename == "." || filename == "/" {
+		return nil, nil
+	}
+
+	// Query all indexed files for this project.
+	rows, err := m.meta.DB().QueryContext(ctx,
+		`SELECT file_path FROM source_index WHERE project_id = ?`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("querying source index: %w", err)
+	}
+	defer rows.Close()
+
+	var bestPath string
+	var bestScore int
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err != nil {
+			continue
+		}
+		// Score by matching path suffix — longer suffix match = better score.
+		score := pathSuffixScore(fp, parsed.Path)
+		if score > bestScore {
+			bestScore = score
+			bestPath = fp
+		}
+	}
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	// Look up GitHub connection to build URL.
+	conn, err := m.meta.GetGitHubConnection(ctx, projectID)
+	if err != nil {
+		return nil, nil
+	}
+
+	ghURL := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s",
+		conn.RepoOwner, conn.RepoName, conn.DefaultBranch, bestPath)
+	if lineno > 0 {
+		ghURL += fmt.Sprintf("#L%d", lineno)
+	}
+
+	return &SourceLink{
+		FilePath:  bestPath,
+		GitHubURL: ghURL,
+		Line:      lineno,
+	}, nil
+}
+
+// pathSuffixScore computes how many path segments of candidate match the suffix of sourceURL.
+func pathSuffixScore(candidate, sourcePath string) int {
+	cParts := strings.Split(candidate, "/")
+	sParts := strings.Split(sourcePath, "/")
+
+	score := 0
+	ci := len(cParts) - 1
+	si := len(sParts) - 1
+	for ci >= 0 && si >= 0 {
+		if strings.EqualFold(cParts[ci], sParts[si]) {
+			score++
+			ci--
+			si--
+		} else {
+			break
+		}
+	}
+	return score
 }
 
 func computeMatchScore(selectors, elementID, elementClasses, parentPath string) float64 {

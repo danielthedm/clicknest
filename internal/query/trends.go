@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/danielleslie/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/auth"
 )
 
 // TrendsBreakdownHandler handles GET /api/v1/trends/breakdown — multi-series trends split by a dimension.

@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/danielleslie/clicknest/internal/auth"
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/auth"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 // ListDashboardsHandler handles GET /api/v1/dashboards.

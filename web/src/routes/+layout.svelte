@@ -4,11 +4,16 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import Logo from '$lib/components/Logo.svelte';
+	import ProjectSwitcher from '$lib/components/ui/ProjectSwitcher.svelte';
+	import { getMe } from '$lib/api';
+	import type { MeResponse } from '$lib/types';
 
 	let { children } = $props();
 
 	const authRoutes = ['/login', '/setup', '/onboarding'];
 	let isAuthRoute = $derived(authRoutes.includes($page.url.pathname));
+
+	let meData: MeResponse | null = $state(null);
 
 	const navItems = [
 		{
@@ -38,6 +43,11 @@
 			icon: 'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z',
 		},
 		{
+			href: '/growth',
+			label: 'Growth',
+			icon: 'M2.25 18L9 11.25l4.306 4.307a11.95 11.95 0 015.814-5.519l2.74-1.22m0 0l-5.94-2.28m5.94 2.28l-2.28 5.941',
+		},
+		{
 			href: '/platform',
 			label: 'Platform',
 			icon: 'M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm0 8a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zm10 0a1 1 0 011-1h4a1 1 0 011 1v6a1 1 0 01-1 1h-4a1 1 0 01-1-1v-6z',
@@ -53,6 +63,10 @@
 				const setupRes = await fetch('/api/v1/auth/setup-required');
 				const setup = await setupRes.json();
 				goto(setup.required ? '/setup' : '/login');
+				return;
+			}
+			if (res.ok) {
+				meData = await res.json();
 			}
 		} catch {
 			goto('/login');
@@ -71,7 +85,7 @@
 	<div class="flex h-screen bg-background">
 		<!-- Sidebar -->
 		<aside class="w-48 border-r border-border bg-card flex flex-col">
-			<div class="p-4 border-b border-border">
+			<div class="relative z-10 p-4 border-b border-border">
 				<a href="/" class="flex items-center gap-1">
 					<Logo class="w-10 h-10 text-primary" />
 					<h1 class="text-lg font-bold tracking-tight">
@@ -79,6 +93,11 @@
 					</h1>
 				</a>
 				<p class="text-xs text-muted-foreground mt-0.5">AI-native analytics</p>
+				{#if meData}
+					<div class="mt-2">
+						<ProjectSwitcher projects={meData.projects} activeProject={meData.active_project} />
+					</div>
+				{/if}
 			</div>
 			<nav class="flex-1 p-2 space-y-0.5">
 				{#each navItems as item}
@@ -108,7 +127,7 @@
 					</svg>
 					Sign out
 				</button>
-				<p class="text-[10px] text-muted-foreground px-2">v0.1.0</p>
+				<p class="text-[10px] text-muted-foreground px-2">v0.2.0</p>
 			</div>
 		</aside>
 

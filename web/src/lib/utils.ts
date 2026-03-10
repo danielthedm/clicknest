@@ -23,11 +23,12 @@ export function relativeTime(ts: string): string {
 
 export function eventDisplayName(event: { event_name?: string; event_type: string; element_tag?: string; element_id?: string; element_text?: string; url_path: string }): string {
 	if (event.event_name) return event.event_name;
-	if (event.event_type === 'pageview') return `Pageview: ${event.url_path}`;
+	if (event.event_type === 'pageview') return `View ${event.url_path}`;
+	if (event.event_type === 'error') return 'Error';
 
 	const parts = [event.event_type];
-	if (event.element_tag) parts.push(`<${event.element_tag}>`);
 	if (event.element_id) parts.push(`#${event.element_id}`);
 	else if (event.element_text) parts.push(`"${event.element_text.substring(0, 30)}"`);
+	else if (event.element_tag) parts.push(`<${event.element_tag}>`);
 	return parts.join(' ');
 }

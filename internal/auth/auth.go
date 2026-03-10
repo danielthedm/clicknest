@@ -5,14 +5,28 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/danielleslie/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/storage"
 )
 
 type contextKey string
 
-const projectKey contextKey = "project"
+const (
+	projectKey contextKey = "project"
+	userIDKey  contextKey = "user_id"
+)
 
 var ErrUnauthorized = errors.New("unauthorized")
+
+// UserIDFromContext retrieves the authenticated user ID from the request context.
+func UserIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(userIDKey).(string)
+	return id
+}
+
+// WithUserID stores the authenticated user ID in the context.
+func WithUserID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, userIDKey, id)
+}
 
 // ProjectFromContext retrieves the authenticated project from the request context.
 func ProjectFromContext(ctx context.Context) *storage.Project {
