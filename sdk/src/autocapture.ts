@@ -59,13 +59,19 @@ function handleClick(e: MouseEvent): void {
   const tag = el.tagName.toLowerCase();
   if (tag === 'html' || tag === 'body') return;
 
+  const ctx = extractContext(el);
+  const text = (ctx.element_text as string) || '';
+  const dataAttrs = ctx.data_attributes as Record<string, string> | undefined;
+
   enqueue({
     event_type: 'click',
-    ...extractContext(el),
+    ...ctx,
     timestamp: Date.now(),
     properties: {
       client_x: e.clientX / window.innerWidth,
       client_y: e.clientY / window.innerHeight,
+      ...(text ? { element_text: text } : {}),
+      ...(dataAttrs || {}),
     },
   });
 }
