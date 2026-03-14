@@ -36,6 +36,11 @@ type Config struct {
 	SDKJS              []byte // Embedded SDK JS bundle (nil in dev mode)
 	GitHubClientID     string // GitHub OAuth app client ID (enables OAuth when set)
 	GitHubClientSecret string // GitHub OAuth app client secret
+	CloudMode          bool   // True when running as a managed cloud instance
+
+	// RouteHook is called at the end of route setup. EE code uses this
+	// to inject billing, signup, and instance routes into the shared mux.
+	RouteHook func(mux *http.ServeMux, meta *storage.SQLite)
 }
 
 type Server struct {
@@ -256,6 +261,19 @@ func (s *Server) routes() {
 			fmt.Fprint(w, "/* ClickNest SDK - build with 'make sdk' */")
 		}
 	})
+
+	// Public config (tells the frontend about cloud mode).
+	s.mux.HandleFunc("GET /api/v1/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"cloud_mode": s.config.CloudMode,
+		})
+	})
+
+	// EE route injection — billing, signup, instance routes.
+	if s.config.RouteHook != nil {
+		s.config.RouteHook(s.mux, s.meta)
+	}
 
 	// SPA catch-all — serve embedded frontend or dev placeholder.
 	if s.config.WebFS != nil {

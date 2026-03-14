@@ -7,6 +7,7 @@ import (
 	"context"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -34,14 +35,32 @@ type Config struct {
 	// Registry allows callers to pre-register connectors before startup.
 	Registry *growth.Registry
 
+	// CloudMode tells the frontend this is a cloud-managed instance.
+	CloudMode bool
+
+	// RouteHook is called after OSS routes are registered. It receives
+	// the shared HTTP mux and the metadata store so that EE code can
+	// inject additional routes (billing, signup, instances) and access
+	// the user/project database directly.
+	RouteHook func(mux *http.ServeMux, meta *storage.SQLite)
+
 	// OnReady is called after the server is configured but before it starts listening.
 	// Use this to inspect or modify startup behavior.
 	OnReady func()
 }
 
-// Run initializes all ClickNest subsystems and starts the HTTP server.
-// It blocks until the process receives SIGINT or SIGTERM, then shuts down gracefully.
-func Run(cfg Config) {
+// App holds initialized ClickNest subsystems.
+type App struct {
+	Meta   *storage.SQLite
+	Events *storage.DuckDB
+	Server *server.Server
+	namer  *ai.Namer
+}
+
+// Setup initializes all ClickNest subsystems and returns an App.
+// The caller must call App.Run() to start the server and App.Close()
+// to release resources.
+func Setup(cfg Config) *App {
 	if cfg.Registry == nil {
 		cfg.Registry = growth.NewRegistry()
 	}
@@ -58,7 +77,6 @@ func Run(cfg Config) {
 	if err != nil {
 		log.Fatalf("opening duckdb: %v", err)
 	}
-	defer events.Close()
 
 	enc, err := storage.NewEncryptor(cfg.DataDir)
 	if err != nil {
@@ -70,7 +88,6 @@ func Run(cfg Config) {
 	if err != nil {
 		log.Fatalf("opening sqlite: %v", err)
 	}
-	defer meta.Close()
 
 	// Ensure a default project exists.
 	ensureDefaultProject(meta)
@@ -89,7 +106,6 @@ func Run(cfg Config) {
 		}
 	}
 	namer := ai.NewNamer(provider, cache, events, 2)
-	defer namer.Close()
 
 	if provider != nil && project != nil {
 		go namer.Backfill(context.Background(), project.ID)
@@ -109,7 +125,7 @@ func Run(cfg Config) {
 	ghClientID := os.Getenv("GITHUB_CLIENT_ID")
 	ghClientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
 
-	// Start HTTP server.
+	// Create HTTP server.
 	srv := server.New(server.Config{
 		Addr:               cfg.Addr,
 		DataDir:            cfg.DataDir,
@@ -118,32 +134,49 @@ func Run(cfg Config) {
 		SDKJS:              cfg.SDKJS,
 		GitHubClientID:     ghClientID,
 		GitHubClientSecret: ghClientSecret,
+		CloudMode:          cfg.CloudMode,
+		RouteHook:          cfg.RouteHook,
 	}, events, meta, namer, syncer, matcher, cfg.Registry)
 
 	if cfg.OnReady != nil {
 		cfg.OnReady()
 	}
 
-	// Graceful shutdown.
+	return &App{
+		Meta:   meta,
+		Events: events,
+		Server: srv,
+		namer:  namer,
+	}
+}
+
+// Run starts the HTTP server and blocks until SIGINT or SIGTERM,
+// then shuts down gracefully.
+func (a *App) Run() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		if err := srv.Start(); err != nil {
+		if err := a.Server.Start(); err != nil {
 			log.Printf("server stopped: %v", err)
 		}
 	}()
-
-	log.Printf("ClickNest started on %s (dev=%v, data=%s)", cfg.Addr, cfg.DevMode, cfg.DataDir)
 
 	<-ctx.Done()
 	log.Println("shutting down...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := a.Server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
+}
+
+// Close releases all resources held by the App.
+func (a *App) Close() {
+	a.namer.Close()
+	a.Meta.Close()
+	a.Events.Close()
 }
 
 func getDefaultProject(meta *storage.SQLite) *storage.Project {

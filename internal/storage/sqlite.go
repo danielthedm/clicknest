@@ -1089,6 +1089,17 @@ func (s *SQLite) GetUserByEmail(ctx context.Context, email string) (*User, error
 	return u, nil
 }
 
+func (s *SQLite) GetUser(ctx context.Context, id string) (*User, error) {
+	u := &User{}
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, email, password_hash, created_at FROM users WHERE id = ?`, id).
+		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
 func (s *SQLite) CreateUserSession(ctx context.Context, userID string, expires time.Time, projectID string) (string, error) {
 	token, err := generateRandomHex(32)
 	if err != nil {
