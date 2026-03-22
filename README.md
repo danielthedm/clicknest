@@ -8,6 +8,7 @@ No manual instrumentation. No tagging every button. No ops overhead — ships as
 
 ## Features
 
+**Analytics**
 - **Autocapture** — clicks, pageviews, form inputs, and submissions captured automatically by the SDK
 - **Error tracking** — captures uncaught JS exceptions and promise rejections with stack traces
 - **AI event naming** — LLM reads your DOM context (and optionally your source code via GitHub) to turn `button.click #checkout` into "User clicked 'Place Order'"
@@ -15,11 +16,24 @@ No manual instrumentation. No tagging every button. No ops overhead — ships as
 - **Path analysis** — page transition flows (where do users go next?)
 - **Retention** — weekly cohort retention curves
 - **Heatmaps** — click density visualization per page
+- **Attribution** — UTM and referrer source tracking
+- **Dashboards** — custom metric dashboards
+- **AI chat** — natural language queries against your analytics data
+
+**Growth**
+- **Lead scoring** — configurable rules (page visits, event counts, property matches) that accumulate points per user
+- **CRM webhooks** — push qualified leads to your CRM when they cross a score threshold
+- **Campaigns** — AI-assisted content generation with A/B testing
+- **ICP analysis** — AI-powered ideal customer profile discovery from your analytics data
+- **Connectors** — pluggable interface for publishing to external channels
+- **Ref codes** — referral and attribution code tracking
+
+**Platform**
 - **Feature flags** — CRUD flags with rollout % and SDK `isEnabled()` check
 - **Alerts** — metric threshold alerts with webhook delivery
-- **Dashboards** — custom metric dashboards
+- **Multi-project** — create multiple projects with team member management
+- **Auth** — email/password authentication with session-based access control
 - **CSV export** — one-click export from any data view
-- **AI chat** — natural language queries against your analytics data
 - **Backup & restore** — export/import your full database as a `.tar.gz`
 
 ---
@@ -56,16 +70,14 @@ fly deploy --primary-region <your-region>
 
 ## First run
 
-On first boot ClickNest automatically creates a default project and prints its API key to stdout:
+On first boot ClickNest prompts you to create an account (email + password). After setup, a default project and API key are created automatically:
 
 ```
 ClickNest started on :8080 (dev=false, data=./data)
 Created default project: default (API key: cn_abc123...)
 ```
 
-**There is no username or password.** The dashboard at `http://localhost:8080` is open to anyone who can reach the server — protect it with a firewall, VPN, or authenticating reverse proxy before exposing it to the internet.
-
-The API key is only needed for the SDK snippet you add to your site. You can always find it again in **Settings → Project** inside the dashboard.
+Log in at `http://localhost:8080` with the credentials you chose during setup. The API key is only needed for the SDK snippet you add to your site — you can always find it again in **Settings → Project** inside the dashboard.
 
 ---
 
@@ -95,9 +107,7 @@ ClickNest.init({
 
 ## Self-Hosting
 
-No Postgres, no Redis, no Kafka. One binary, one port, two embedded databases.
-
-> **Security note:** ClickNest is single-tenant with no built-in login. The dashboard is accessible to anyone who can reach the server. **Do not expose port 8080 directly to the internet.** Protect it with a firewall, VPN, or an authenticating reverse proxy (e.g. [Authelia](https://www.authelia.com/), Cloudflare Access, or basic auth via Nginx).
+No Postgres, no Redis, no Kafka. One binary, one port, two embedded databases. Built-in email/password authentication protects the dashboard.
 
 ### Server requirements
 
@@ -292,7 +302,7 @@ This happens asynchronously — events are stored immediately, names appear as t
 
 ## Building from source
 
-Requires Go 1.23+ and Node 20+.
+Requires Go 1.25+ and Node 20+.
 
 ```bash
 # Install dependencies and build everything
