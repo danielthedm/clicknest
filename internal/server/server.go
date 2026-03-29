@@ -352,8 +352,11 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/experiments/{id}/declare-winner", sessionAuth(http.HandlerFunc(s.declareWinnerHandler)))
 
 	// Backup / restore.
-	s.mux.Handle("GET /api/v1/export", sessionAuth(http.HandlerFunc(s.exportHandler)))
-	s.mux.Handle("POST /api/v1/import", sessionAuth(http.HandlerFunc(s.importHandler)))
+	// Backup export/import — disabled in cloud mode to prevent leaking shared data.
+	if !s.config.CloudMode {
+		s.mux.Handle("GET /api/v1/export", sessionAuth(http.HandlerFunc(s.exportHandler)))
+		s.mux.Handle("POST /api/v1/import", sessionAuth(http.HandlerFunc(s.importHandler)))
+	}
 
 	// Storage stats.
 	s.mux.Handle("GET /api/v1/storage", sessionAuth(http.HandlerFunc(s.storageHandler)))

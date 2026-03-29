@@ -521,7 +521,8 @@
 	</div>
 	{/if}
 
-	<!-- Backup & Restore -->
+	<!-- Backup & Restore (hidden in cloud mode) -->
+	{#if storage && storage.volume_bytes > 0}
 	<div class="border border-border rounded-lg p-6 space-y-4">
 		<div>
 			<h2 class="text-base font-semibold">Backup & Restore</h2>
@@ -573,4 +574,5 @@
 			</div>
 		</div>
 	</div>
+	{/if}
 </div>
