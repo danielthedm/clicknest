@@ -125,8 +125,9 @@ func (s *Server) meHandler(w http.ResponseWriter, r *http.Request) {
 	activeProject := auth.ProjectFromContext(r.Context())
 
 	projects, _ := s.meta.ListUserProjects(r.Context(), userID)
-	// Fallback for users with no memberships yet.
-	if len(projects) == 0 {
+	// In single-tenant (non-cloud) mode, fall back to all projects for
+	// users with no memberships. In cloud mode, never leak other users' projects.
+	if len(projects) == 0 && !s.config.CloudMode {
 		projects, _ = s.meta.ListProjects(r.Context())
 	}
 
