@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { listCampaigns, generateCampaign, deleteCampaign, createABTest, getABResults } from '$lib/api';
+	import { listCampaigns, generateCampaign, deleteCampaign, createABTest, getABResults, publishCampaign, listConnectors } from '$lib/api';
 	import { formatTime, relativeTime } from '$lib/utils';
-	import type { Campaign, CampaignContent, ABVariation } from '$lib/types';
+	import type { Campaign, CampaignContent, ABVariation, ConnectorInfo } from '$lib/types';
 
 	let campaigns = $state<Campaign[]>([]);
+	let campaignStats = $state<Record<string, { sessions: number; users: number; bounced: number; avg_pages: number }>>({});
 	let loading = $state(true);
 	let generating = $state(false);
 	let showGenerate = $state(false);
@@ -15,6 +16,13 @@
 	let expandedId = $state<string | null>(null);
 	let abResults = $state<ABVariation[]>([]);
 	let abLoading = $state(false);
+
+	// Publish flow
+	let publishers = $state<ConnectorInfo[]>([]);
+	let publishingId = $state<string | null>(null);
+	let publishModalId = $state<string | null>(null);
+	let publishPublisher = $state('');
+	let publishError = $state('');
 
 	const channels = [
 		{ value: 'reddit', label: 'Reddit' },
@@ -30,13 +38,21 @@
 		archived: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400',
 	};
 
-	onMount(() => loadCampaigns());
+	onMount(async () => {
+		loadCampaigns();
+		try {
+			const res = await listConnectors();
+			publishers = res.connectors ?? [];
+			if (publishers.length > 0) publishPublisher = publishers[0].name;
+		} catch {}
+	});
 
 	async function loadCampaigns() {
 		loading = true;
 		try {
 			const res = await listCampaigns();
 			campaigns = res.campaigns ?? [];
+			campaignStats = res.stats ?? {};
 		} catch (e) {
 			console.error('Failed to load campaigns:', e);
 		}
@@ -61,6 +77,20 @@
 	async function handleDelete(id: string) {
 		await deleteCampaign(id);
 		loadCampaigns();
+	}
+
+	async function handlePublish(campaignId: string) {
+		if (!publishPublisher) return;
+		publishingId = campaignId;
+		publishError = '';
+		try {
+			await publishCampaign(campaignId, { publisher_name: publishPublisher });
+			publishModalId = null;
+			await loadCampaigns();
+		} catch (e) {
+			publishError = String(e);
+		}
+		publishingId = null;
 	}
 
 	function parseContent(content: string): CampaignContent | null {
@@ -149,6 +179,7 @@
 		<div class="space-y-3">
 			{#each campaigns as campaign}
 				{@const content = parseContent(campaign.content)}
+				{@const cstats = campaignStats[campaign.id]}
 				<div class="border border-border rounded-lg bg-card">
 					<div class="px-4 py-3 flex items-center justify-between">
 						<div class="flex items-center gap-3">
@@ -158,11 +189,21 @@
 									<span class="text-xs px-1.5 py-0.5 rounded {statusColors[campaign.status] ?? statusColors.draft}">{campaign.status}</span>
 									<span class="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">{campaign.channel}</span>
 								</div>
-								<p class="text-xs text-muted-foreground mt-0.5">{relativeTime(campaign.created_at)}</p>
+								<div class="flex items-center gap-3 mt-0.5">
+									<p class="text-xs text-muted-foreground">{relativeTime(campaign.created_at)}</p>
+									{#if cstats}
+										<span class="text-xs text-muted-foreground">{cstats.sessions.toLocaleString()} sessions</span>
+										<span class="text-xs text-muted-foreground">{cstats.users.toLocaleString()} users</span>
+									{/if}
+								</div>
 							</div>
 						</div>
 						<div class="flex items-center gap-2">
+							<a href="/growth/campaigns/{campaign.id}" class="px-2 py-1 text-xs border border-border rounded hover:bg-muted">Performance</a>
 							<button onclick={() => copyContent(campaign)} class="px-2 py-1 text-xs border border-border rounded hover:bg-muted">Copy</button>
+							{#if publishers.length > 0}
+								<button onclick={() => { publishModalId = campaign.id; publishError = ''; }} class="px-2 py-1 text-xs border border-border rounded hover:bg-muted">Publish</button>
+							{/if}
 							<button onclick={() => handleABTest(campaign.id)} disabled={abLoading} class="px-2 py-1 text-xs border border-border rounded hover:bg-muted">A/B Test</button>
 							<button onclick={() => toggleExpand(campaign.id)} class="px-2 py-1 text-xs border border-border rounded hover:bg-muted">
 								{expandedId === campaign.id ? 'Collapse' : 'Details'}
@@ -237,3 +278,30 @@
 		</div>
 	{/if}
 </div>
+
+{#if publishModalId}
+	<div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+		<div class="bg-background border border-border rounded-lg p-6 w-full max-w-sm space-y-4">
+			<h3 class="font-medium text-sm">Publish Campaign</h3>
+			<div>
+				<label class="text-xs font-medium text-muted-foreground">Publisher</label>
+				<select bind:value={publishPublisher} class="w-full mt-1 text-sm border border-border rounded-md px-3 py-1.5 bg-background">
+					{#each publishers as pub}
+						<option value={pub.name}>{pub.display_name}</option>
+					{/each}
+				</select>
+			</div>
+			{#if publishError}
+				<p class="text-xs text-destructive">{publishError}</p>
+			{/if}
+			<div class="flex gap-2 justify-end">
+				<button onclick={() => publishModalId = null} class="text-sm px-3 py-1.5 border border-border rounded-md hover:bg-muted">Cancel</button>
+				<button
+					onclick={() => handlePublish(publishModalId!)}
+					disabled={publishingId !== null}
+					class="text-sm px-3 py-1.5 bg-primary text-primary-foreground rounded-md hover:opacity-90 disabled:opacity-50"
+				>{publishingId ? 'Publishing...' : 'Publish'}</button>
+			</div>
+		</div>
+	</div>
+{/if}

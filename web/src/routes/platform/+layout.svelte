@@ -5,6 +5,7 @@
 	const tabs = [
 		{ href: '/platform/dashboards', label: 'Dashboards' },
 		{ href: '/platform/flags', label: 'Flags' },
+		{ href: '/platform/experiments', label: 'Experiments' },
 		{ href: '/platform/settings', label: 'Settings' },
 	];
 </script>

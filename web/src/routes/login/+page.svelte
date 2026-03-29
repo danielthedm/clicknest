@@ -1,11 +1,23 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import Logo from '$lib/components/Logo.svelte';
 
 	let email = $state('');
 	let password = $state('');
 	let error = $state('');
 	let loading = $state(false);
+
+	// Handle token-based login from marketing site redirect.
+	onMount(() => {
+		const token = $page.url.searchParams.get('token');
+		if (token) {
+			// Set session cookie and redirect to dashboard.
+			document.cookie = `clicknest_session=${token}; path=/; max-age=${7 * 24 * 60 * 60}; samesite=lax`;
+			goto('/');
+		}
+	});
 
 	async function handleLogin(e: Event) {
 		e.preventDefault();

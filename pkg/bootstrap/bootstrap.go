@@ -44,6 +44,26 @@ type Config struct {
 	// the user/project database directly.
 	RouteHook func(mux *http.ServeMux, meta *storage.SQLite)
 
+	// ResourceLimitFn, if set, is consulted before creating metered resources
+	// (campaigns, leads, etc.). Returns HTTP status + message when exceeded,
+	// or 0/"" to allow. Nil means unlimited (self-hosted default).
+	ResourceLimitFn func(ctx context.Context, projectID, metric string) (int, string)
+
+	// RetentionDaysFn, if set, returns the data retention window in days for a project.
+	// Return -1 for unlimited, or a positive number to delete older events.
+	// When nil, the server uses a 365-day default.
+	RetentionDaysFn func(ctx context.Context, projectID string) int
+
+	// RateLimitFn, if set, returns per-project event ingestion rate limits (tokens/sec, burst).
+	// Return rate <= 0 to disable rate limiting for the project (e.g. enterprise tier).
+	// When nil, the default 10/s, 50 burst limits apply.
+	RateLimitFn func(ctx context.Context, projectID string) (rate float64, burst int)
+
+	// OnEventIngested, if set, is called after a successful event batch is written.
+	// It receives the project ID and the number of events accepted.
+	// Used by EE to increment the monthly usage counter in PostgreSQL.
+	OnEventIngested func(ctx context.Context, projectID string, count int64)
+
 	// OnReady is called after the server is configured but before it starts listening.
 	// Use this to inspect or modify startup behavior.
 	OnReady func()
@@ -136,6 +156,10 @@ func Setup(cfg Config) *App {
 		GitHubClientSecret: ghClientSecret,
 		CloudMode:          cfg.CloudMode,
 		RouteHook:          cfg.RouteHook,
+		ResourceLimitFn:    cfg.ResourceLimitFn,
+		RetentionDaysFn:    cfg.RetentionDaysFn,
+		RateLimitFn:        cfg.RateLimitFn,
+		OnEventIngested:    cfg.OnEventIngested,
 	}, events, meta, namer, syncer, matcher, cfg.Registry)
 
 	if cfg.OnReady != nil {

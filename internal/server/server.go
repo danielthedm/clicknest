@@ -3,7 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,12 +14,15 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"text/template"
 	"time"
 
 	"github.com/danielthedm/clicknest/internal/ai"
@@ -25,6 +31,7 @@ import (
 	"github.com/danielthedm/clicknest/internal/growth"
 	"github.com/danielthedm/clicknest/internal/ingest"
 	"github.com/danielthedm/clicknest/internal/query"
+	"github.com/danielthedm/clicknest/internal/ratelimit"
 	"github.com/danielthedm/clicknest/internal/storage"
 )
 
@@ -41,30 +48,60 @@ type Config struct {
 	// RouteHook is called at the end of route setup. EE code uses this
 	// to inject billing, signup, and instance routes into the shared mux.
 	RouteHook func(mux *http.ServeMux, meta *storage.SQLite)
+
+	// ResourceLimitFn, if set, is consulted before creating metered resources.
+	// It returns an HTTP status code and error message if the limit is exceeded,
+	// or 0 and "" to allow the request. Nil means unlimited (self-hosted mode).
+	ResourceLimitFn func(ctx context.Context, projectID, metric string) (int, string)
+
+	// RetentionDaysFn, if set, returns the data retention window in days for a project.
+	// Return -1 for unlimited retention, or a positive number of days to delete older events.
+	// When nil, the server uses a 365-day default for all projects.
+	RetentionDaysFn func(ctx context.Context, projectID string) int
+
+	// RateLimitFn, if set, returns per-project event ingestion rate limits (tokens/sec, burst).
+	// Return rate <= 0 to disable rate limiting for the project (e.g. enterprise tier).
+	// When nil, the default 10/s, 50 burst limits apply.
+	RateLimitFn func(ctx context.Context, projectID string) (rate float64, burst int)
+
+	// OnEventIngested, if set, is called after a successful event batch is written to DuckDB.
+	// It receives the project ID and the number of events accepted.
+	// Used by EE to increment the monthly usage counter in PostgreSQL.
+	OnEventIngested func(ctx context.Context, projectID string, count int64)
+
+	// MaxConcurrentQueries is the maximum number of concurrent DuckDB analytics queries
+	// allowed per project. 0 means unlimited. Default applied in New() if unset.
+	MaxConcurrentQueries int
 }
 
 type Server struct {
-	config   Config
-	events   *storage.DuckDB
-	meta     *storage.SQLite
-	namer    *ai.Namer
-	syncer   *ghub.Syncer
-	matcher  *ghub.Matcher
-	registry *growth.Registry
-	mux      *http.ServeMux
-	server   *http.Server
+	config       Config
+	events       *storage.DuckDB
+	meta         *storage.SQLite
+	namer        *ai.Namer
+	syncer       *ghub.Syncer
+	matcher      *ghub.Matcher
+	registry     *growth.Registry
+	eventLimiter *ratelimit.Limiter
+	querySlots   sync.Map // projectID → chan struct{} (semaphore)
+	mux          *http.ServeMux
+	server       *http.Server
 }
 
 func New(config Config, events *storage.DuckDB, meta *storage.SQLite, namer *ai.Namer, syncer *ghub.Syncer, matcher *ghub.Matcher, registry *growth.Registry) *Server {
+	if config.MaxConcurrentQueries == 0 {
+		config.MaxConcurrentQueries = 5
+	}
 	s := &Server{
-		config:   config,
-		events:   events,
-		meta:     meta,
-		namer:    namer,
-		syncer:   syncer,
-		matcher:  matcher,
-		registry: registry,
-		mux:      http.NewServeMux(),
+		config:       config,
+		events:       events,
+		meta:         meta,
+		namer:        namer,
+		syncer:       syncer,
+		matcher:      matcher,
+		registry:     registry,
+		eventLimiter: ratelimit.New(10, 50),
+		mux:          http.NewServeMux(),
 	}
 	s.routes()
 	s.server = &http.Server{
@@ -79,24 +116,51 @@ func New(config Config, events *storage.DuckDB, meta *storage.SQLite, namer *ai.
 
 func (s *Server) routes() {
 	ingestHandler := ingest.NewHandler(s.events, s.namer)
+	if s.config.OnEventIngested != nil {
+		fn := s.config.OnEventIngested
+		ingestHandler.OnIngested = func(projectID string, count int64) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			fn(ctx, projectID, count)
+		}
+	}
 	queryHandler := query.NewHandler(s.events, s.meta)
 	queryHandler.SetMatcher(s.matcher)
 
 	apiKeyAuth := auth.APIKeyMiddleware(s.meta)
 	sessionAuth := auth.SessionMiddleware(s.meta)
 
-	// SDK ingestion endpoint (API key auth).
-	s.mux.Handle("POST /api/v1/events", apiKeyAuth(ingestHandler))
+	// SDK ingestion endpoint (API key auth + rate limiting).
+	rateLimitedIngest := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		project := auth.ProjectFromContext(r.Context())
+		if project != nil {
+			allowed := false
+			if s.config.RateLimitFn != nil {
+				rate, burst := s.config.RateLimitFn(r.Context(), project.ID)
+				allowed = s.eventLimiter.AllowRate(project.ID, rate, burst)
+			} else {
+				allowed = s.eventLimiter.Allow(project.ID)
+			}
+			if !allowed {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				return
+			}
+		}
+		ingestHandler.ServeHTTP(w, r)
+	})
+	s.mux.Handle("POST /api/v1/events", apiKeyAuth(rateLimitedIngest))
 
-	// Dashboard query endpoints (session auth).
-	s.mux.Handle("GET /api/v1/events", sessionAuth(http.HandlerFunc(queryHandler.EventsHandler)))
-	s.mux.Handle("GET /api/v1/events/stats", sessionAuth(http.HandlerFunc(queryHandler.EventStatsHandler)))
+	// Dashboard query endpoints (session auth + per-project concurrent query limit).
+	ql := s.withQueryLimit
+	s.mux.Handle("GET /api/v1/events", sessionAuth(ql(http.HandlerFunc(queryHandler.EventsHandler))))
+	s.mux.Handle("GET /api/v1/events/stats", sessionAuth(ql(http.HandlerFunc(queryHandler.EventStatsHandler))))
 	s.mux.Handle("GET /api/v1/events/live", sessionAuth(http.HandlerFunc(s.liveEventsHandler)))
-	s.mux.Handle("GET /api/v1/trends", sessionAuth(http.HandlerFunc(queryHandler.TrendsHandler)))
-	s.mux.Handle("GET /api/v1/trends/breakdown", sessionAuth(http.HandlerFunc(queryHandler.TrendsBreakdownHandler)))
-	s.mux.Handle("GET /api/v1/pages", sessionAuth(http.HandlerFunc(queryHandler.PagesHandler)))
-	s.mux.Handle("GET /api/v1/sessions", sessionAuth(http.HandlerFunc(queryHandler.SessionsHandler)))
-	s.mux.Handle("GET /api/v1/sessions/{id}", sessionAuth(http.HandlerFunc(queryHandler.SessionDetailHandler)))
+	s.mux.Handle("GET /api/v1/trends", sessionAuth(ql(http.HandlerFunc(queryHandler.TrendsHandler))))
+	s.mux.Handle("GET /api/v1/trends/breakdown", sessionAuth(ql(http.HandlerFunc(queryHandler.TrendsBreakdownHandler))))
+	s.mux.Handle("GET /api/v1/pages", sessionAuth(ql(http.HandlerFunc(queryHandler.PagesHandler))))
+	s.mux.Handle("GET /api/v1/sessions", sessionAuth(ql(http.HandlerFunc(queryHandler.SessionsHandler))))
+	s.mux.Handle("GET /api/v1/sessions/{id}", sessionAuth(ql(http.HandlerFunc(queryHandler.SessionDetailHandler))))
 
 	// Properties.
 	s.mux.Handle("GET /api/v1/properties/keys", sessionAuth(http.HandlerFunc(queryHandler.PropertyKeysHandler)))
@@ -111,15 +175,15 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/funnels", sessionAuth(http.HandlerFunc(queryHandler.CreateFunnelHandler)))
 	s.mux.Handle("GET /api/v1/funnels/{id}", sessionAuth(http.HandlerFunc(queryHandler.GetFunnelHandler)))
 	s.mux.Handle("DELETE /api/v1/funnels/{id}", sessionAuth(http.HandlerFunc(queryHandler.DeleteFunnelHandler)))
-	s.mux.Handle("GET /api/v1/funnels/{id}/results", sessionAuth(http.HandlerFunc(queryHandler.FunnelResultsHandler)))
-	s.mux.Handle("GET /api/v1/funnels/{id}/cohorts", sessionAuth(http.HandlerFunc(queryHandler.FunnelCohortsHandler)))
+	s.mux.Handle("GET /api/v1/funnels/{id}/results", sessionAuth(ql(http.HandlerFunc(queryHandler.FunnelResultsHandler))))
+	s.mux.Handle("GET /api/v1/funnels/{id}/cohorts", sessionAuth(ql(http.HandlerFunc(queryHandler.FunnelCohortsHandler))))
 	s.mux.Handle("POST /api/v1/funnels/suggest", sessionAuth(http.HandlerFunc(s.suggestFunnelsHandler)))
 
 	// AI chat.
 	s.mux.Handle("POST /api/v1/ai/chat", sessionAuth(http.HandlerFunc(s.aiChatHandler)))
 
 	// Retention.
-	s.mux.Handle("GET /api/v1/retention", sessionAuth(http.HandlerFunc(queryHandler.RetentionHandler)))
+	s.mux.Handle("GET /api/v1/retention", sessionAuth(ql(http.HandlerFunc(queryHandler.RetentionHandler))))
 
 	// Dashboards.
 	s.mux.Handle("GET /api/v1/dashboards", sessionAuth(http.HandlerFunc(queryHandler.ListDashboardsHandler)))
@@ -160,14 +224,14 @@ func (s *Server) routes() {
 	s.mux.Handle("DELETE /api/v1/alerts/{id}", sessionAuth(http.HandlerFunc(s.deleteAlertHandler)))
 
 	// Path analysis.
-	s.mux.Handle("GET /api/v1/paths", sessionAuth(http.HandlerFunc(queryHandler.PathsHandler)))
+	s.mux.Handle("GET /api/v1/paths", sessionAuth(ql(http.HandlerFunc(queryHandler.PathsHandler))))
 
 	// Heatmap.
-	s.mux.Handle("GET /api/v1/heatmap", sessionAuth(http.HandlerFunc(queryHandler.HeatmapHandler)))
+	s.mux.Handle("GET /api/v1/heatmap", sessionAuth(ql(http.HandlerFunc(queryHandler.HeatmapHandler))))
 
 	// Attribution.
-	s.mux.Handle("GET /api/v1/attribution", sessionAuth(http.HandlerFunc(queryHandler.AttributionHandler)))
-	s.mux.Handle("GET /api/v1/attribution/sources", sessionAuth(http.HandlerFunc(queryHandler.AttributionSourcesHandler)))
+	s.mux.Handle("GET /api/v1/attribution", sessionAuth(ql(http.HandlerFunc(queryHandler.AttributionHandler))))
+	s.mux.Handle("GET /api/v1/attribution/sources", sessionAuth(ql(http.HandlerFunc(queryHandler.AttributionSourcesHandler))))
 
 	// Ref codes.
 	s.mux.Handle("GET /api/v1/refcodes", sessionAuth(http.HandlerFunc(s.listRefCodesHandler)))
@@ -175,12 +239,12 @@ func (s *Server) routes() {
 	s.mux.Handle("PUT /api/v1/refcodes/{id}", sessionAuth(http.HandlerFunc(s.updateRefCodeHandler)))
 	s.mux.Handle("DELETE /api/v1/refcodes/{id}", sessionAuth(http.HandlerFunc(s.deleteRefCodeHandler)))
 
-	// Lead scoring.
-	s.mux.Handle("GET /api/v1/leads", sessionAuth(http.HandlerFunc(queryHandler.LeadScoresHandler)))
+	// Lead scoring (with optional per-project lead-count limit check).
+	s.mux.Handle("GET /api/v1/leads", sessionAuth(s.leadLimitCheck(http.HandlerFunc(queryHandler.LeadScoresHandler))))
 
 	// Scoring rules.
 	s.mux.Handle("GET /api/v1/scoring-rules", sessionAuth(http.HandlerFunc(s.listScoringRulesHandler)))
-	s.mux.Handle("POST /api/v1/scoring-rules", sessionAuth(http.HandlerFunc(s.createScoringRuleHandler)))
+	s.mux.Handle("POST /api/v1/scoring-rules", sessionAuth(s.leadLimitCheck(http.HandlerFunc(s.createScoringRuleHandler))))
 	s.mux.Handle("PUT /api/v1/scoring-rules/{id}", sessionAuth(http.HandlerFunc(s.updateScoringRuleHandler)))
 	s.mux.Handle("DELETE /api/v1/scoring-rules/{id}", sessionAuth(http.HandlerFunc(s.deleteScoringRuleHandler)))
 
@@ -190,12 +254,42 @@ func (s *Server) routes() {
 	s.mux.Handle("PUT /api/v1/crm-webhooks/{id}", sessionAuth(http.HandlerFunc(s.updateCRMWebhookHandler)))
 	s.mux.Handle("DELETE /api/v1/crm-webhooks/{id}", sessionAuth(http.HandlerFunc(s.deleteCRMWebhookHandler)))
 	s.mux.Handle("POST /api/v1/crm-webhooks/{id}/test", sessionAuth(http.HandlerFunc(s.testCRMWebhookHandler)))
+	s.mux.Handle("GET /api/v1/crm-webhooks/{id}/deliveries", sessionAuth(http.HandlerFunc(s.webhookDeliveriesHandler)))
+	s.mux.Handle("POST /api/v1/crm-webhooks/{id}/deliveries/{deliveryId}/retry", sessionAuth(http.HandlerFunc(s.retryWebhookDeliveryHandler)))
+	s.mux.Handle("GET /api/v1/crm-webhooks/dead-letters", sessionAuth(http.HandlerFunc(s.deadLettersHandler)))
 
-	// Connectors.
-	s.mux.Handle("GET /api/v1/connectors", sessionAuth(http.HandlerFunc(s.listConnectorsHandler)))
-	s.mux.Handle("POST /api/v1/connectors/{name}/post", sessionAuth(http.HandlerFunc(s.connectorPostHandler)))
-	s.mux.Handle("GET /api/v1/connectors/{name}/engagement/{externalID}", sessionAuth(http.HandlerFunc(s.connectorEngagementHandler)))
-	s.mux.Handle("GET /api/v1/connectors/{name}/validate", sessionAuth(http.HandlerFunc(s.connectorValidateHandler)))
+	// Publishers (outbound connectors).
+	s.mux.Handle("GET /api/v1/publishers", sessionAuth(http.HandlerFunc(s.listPublishersHandler)))
+	s.mux.Handle("POST /api/v1/publishers/{name}/post", sessionAuth(http.HandlerFunc(s.publisherPostHandler)))
+	s.mux.Handle("GET /api/v1/publishers/{name}/engagement/{externalID}", sessionAuth(http.HandlerFunc(s.publisherEngagementHandler)))
+	s.mux.Handle("GET /api/v1/publishers/{name}/validate", sessionAuth(http.HandlerFunc(s.publisherValidateHandler)))
+
+	// Keep legacy connector routes for backward compat with existing SDK/frontend.
+	s.mux.Handle("GET /api/v1/connectors", sessionAuth(http.HandlerFunc(s.listPublishersHandler)))
+	s.mux.Handle("POST /api/v1/connectors/{name}/post", sessionAuth(http.HandlerFunc(s.publisherPostHandler)))
+	s.mux.Handle("GET /api/v1/connectors/{name}/engagement/{externalID}", sessionAuth(http.HandlerFunc(s.publisherEngagementHandler)))
+	s.mux.Handle("GET /api/v1/connectors/{name}/validate", sessionAuth(http.HandlerFunc(s.publisherValidateHandler)))
+
+	// Sources (inbound connectors).
+	s.mux.Handle("GET /api/v1/sources", sessionAuth(http.HandlerFunc(s.listSourcesHandler)))
+	s.mux.Handle("POST /api/v1/sources/{name}/search", sessionAuth(http.HandlerFunc(s.triggerSourceSearchHandler)))
+	// Source credentials (OAuth setup flow).
+	s.mux.Handle("GET /api/v1/sources/{name}/credentials", sessionAuth(http.HandlerFunc(s.getSourceCredentialsHandler)))
+	s.mux.Handle("POST /api/v1/sources/{name}/credentials", sessionAuth(http.HandlerFunc(s.saveSourceCredentialsHandler)))
+	s.mux.Handle("DELETE /api/v1/sources/{name}/credentials", sessionAuth(http.HandlerFunc(s.deleteSourceCredentialsHandler)))
+	s.mux.Handle("GET /api/v1/sources/{name}/oauth/authorize", sessionAuth(http.HandlerFunc(s.sourceOAuthAuthorizeHandler)))
+	s.mux.HandleFunc("GET /api/v1/sources/{name}/oauth/callback", s.sourceOAuthCallbackHandler) // no session auth — browser redirect
+
+	// Source configs.
+	s.mux.Handle("GET /api/v1/source-configs", sessionAuth(http.HandlerFunc(s.listSourceConfigsHandler)))
+	s.mux.Handle("POST /api/v1/source-configs", sessionAuth(http.HandlerFunc(s.upsertSourceConfigHandler)))
+
+	// Mentions inbox.
+	s.mux.Handle("GET /api/v1/mentions", sessionAuth(http.HandlerFunc(s.listMentionsHandler)))
+	s.mux.Handle("GET /api/v1/mentions/{id}", sessionAuth(http.HandlerFunc(s.getMentionHandler)))
+	s.mux.Handle("PUT /api/v1/mentions/{id}", sessionAuth(http.HandlerFunc(s.updateMentionHandler)))
+	s.mux.Handle("POST /api/v1/mentions/{id}/draft", sessionAuth(http.HandlerFunc(s.draftMentionReplyHandler)))
+	s.mux.Handle("POST /api/v1/mentions/{id}/reply", sessionAuth(http.HandlerFunc(s.publishMentionReplyHandler)))
 
 	// Campaigns.
 	s.mux.Handle("GET /api/v1/campaigns", sessionAuth(http.HandlerFunc(s.listCampaignsHandler)))
@@ -206,9 +300,51 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/campaigns/generate", sessionAuth(http.HandlerFunc(s.generateCampaignHandler)))
 	s.mux.Handle("POST /api/v1/campaigns/{id}/ab-test", sessionAuth(http.HandlerFunc(s.abTestHandler)))
 	s.mux.Handle("GET /api/v1/campaigns/{id}/ab-results", sessionAuth(http.HandlerFunc(queryHandler.ABResultsHandler)))
+	s.mux.Handle("GET /api/v1/campaigns/{id}/performance", sessionAuth(http.HandlerFunc(s.campaignPerformanceHandler)))
+	s.mux.Handle("POST /api/v1/campaigns/{id}/publish", sessionAuth(http.HandlerFunc(s.publishCampaignHandler)))
+	s.mux.Handle("POST /api/v1/campaigns/{id}/refresh-engagement", sessionAuth(http.HandlerFunc(s.refreshCampaignEngagementHandler)))
 
 	// ICP.
 	s.mux.Handle("POST /api/v1/icp/analyze", sessionAuth(http.HandlerFunc(s.icpAnalyzeHandler)))
+	s.mux.Handle("GET /api/v1/icp/analyses", sessionAuth(http.HandlerFunc(s.listICPAnalysesHandler)))
+	s.mux.Handle("GET /api/v1/icp/analyses/{id}", sessionAuth(http.HandlerFunc(s.getICPAnalysisHandler)))
+	s.mux.Handle("DELETE /api/v1/icp/analyses/{id}", sessionAuth(http.HandlerFunc(s.deleteICPAnalysisHandler)))
+	s.mux.Handle("POST /api/v1/icp/analyses/{id}/generate-campaign", sessionAuth(http.HandlerFunc(s.icpGenerateCampaignHandler)))
+	s.mux.Handle("POST /api/v1/icp/analyses/{id}/create-scoring-rules", sessionAuth(http.HandlerFunc(s.icpCreateScoringRulesHandler)))
+	s.mux.Handle("GET /api/v1/icp/settings", sessionAuth(http.HandlerFunc(s.getICPSettingsHandler)))
+	s.mux.Handle("PUT /api/v1/icp/settings", sessionAuth(http.HandlerFunc(s.putICPSettingsHandler)))
+
+	// Lead score history + attribution.
+	s.mux.Handle("GET /api/v1/leads/{id}/score-history", sessionAuth(http.HandlerFunc(s.leadScoreHistoryHandler)))
+	s.mux.Handle("GET /api/v1/leads/{id}/attribution", sessionAuth(http.HandlerFunc(s.leadAttributionHandler)))
+
+	// Segments.
+	s.mux.Handle("GET /api/v1/segments", sessionAuth(http.HandlerFunc(s.listSegmentsHandler)))
+	s.mux.Handle("POST /api/v1/segments", sessionAuth(http.HandlerFunc(s.createSegmentHandler)))
+	s.mux.Handle("DELETE /api/v1/segments/{id}", sessionAuth(http.HandlerFunc(s.deleteSegmentHandler)))
+	s.mux.Handle("GET /api/v1/segments/{id}/members", sessionAuth(ql(http.HandlerFunc(s.segmentMembersHandler))))
+
+	// Conversion Goals.
+	s.mux.Handle("GET /api/v1/conversion-goals", sessionAuth(http.HandlerFunc(s.listConversionGoalsHandler)))
+	s.mux.Handle("POST /api/v1/conversion-goals", sessionAuth(http.HandlerFunc(s.createConversionGoalHandler)))
+	s.mux.Handle("GET /api/v1/conversion-goals/{id}", sessionAuth(http.HandlerFunc(s.getConversionGoalHandler)))
+	s.mux.Handle("PUT /api/v1/conversion-goals/{id}", sessionAuth(http.HandlerFunc(s.updateConversionGoalHandler)))
+	s.mux.Handle("DELETE /api/v1/conversion-goals/{id}", sessionAuth(http.HandlerFunc(s.deleteConversionGoalHandler)))
+	s.mux.Handle("GET /api/v1/conversion-goals/{id}/results", sessionAuth(ql(http.HandlerFunc(queryHandler.ConversionGoalResultsHandler))))
+
+	// Revenue attribution.
+	s.mux.Handle("GET /api/v1/attribution/revenue", sessionAuth(ql(http.HandlerFunc(queryHandler.RevenueAttributionHandler))))
+
+	// Experiments.
+	s.mux.Handle("GET /api/v1/experiments", sessionAuth(http.HandlerFunc(s.listExperimentsHandler)))
+	s.mux.Handle("POST /api/v1/experiments", sessionAuth(http.HandlerFunc(s.createExperimentHandler)))
+	s.mux.Handle("GET /api/v1/experiments/{id}", sessionAuth(http.HandlerFunc(s.getExperimentHandler)))
+	s.mux.Handle("PUT /api/v1/experiments/{id}", sessionAuth(http.HandlerFunc(s.updateExperimentHandler)))
+	s.mux.Handle("DELETE /api/v1/experiments/{id}", sessionAuth(http.HandlerFunc(s.deleteExperimentHandler)))
+	s.mux.Handle("GET /api/v1/experiments/{id}/results", sessionAuth(ql(http.HandlerFunc(queryHandler.ExperimentResultsHandler))))
+	s.mux.Handle("GET /api/v1/experiments/{id}/sample-size", sessionAuth(http.HandlerFunc(queryHandler.ExperimentSampleSizeHandler)))
+	s.mux.Handle("POST /api/v1/experiments/{id}/stop", sessionAuth(http.HandlerFunc(s.stopExperimentHandler)))
+	s.mux.Handle("POST /api/v1/experiments/{id}/declare-winner", sessionAuth(http.HandlerFunc(s.declareWinnerHandler)))
 
 	// Backup / restore.
 	s.mux.Handle("GET /api/v1/export", sessionAuth(http.HandlerFunc(s.exportHandler)))
@@ -222,10 +358,12 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/github/oauth/authorize", sessionAuth(http.HandlerFunc(s.githubOAuthAuthorizeHandler)))
 	s.mux.HandleFunc("GET /api/v1/github/oauth/callback", s.githubOAuthCallbackHandler) // No session auth — browser redirect from GitHub
 
-	// Auth (no session required).
+	// Auth (no session required). In cloud mode, signup/login are handled by EE RouteHook.
 	s.mux.HandleFunc("GET /api/v1/auth/setup-required", s.setupRequiredHandler)
-	s.mux.HandleFunc("POST /api/v1/auth/setup", s.setupHandler)
-	s.mux.HandleFunc("POST /api/v1/auth/login", s.loginHandler)
+	if !s.config.CloudMode {
+		s.mux.HandleFunc("POST /api/v1/auth/setup", s.setupHandler)
+		s.mux.HandleFunc("POST /api/v1/auth/login", s.loginHandler)
+	}
 	s.mux.HandleFunc("POST /api/v1/auth/logout", s.logoutHandler)
 	s.mux.Handle("GET /api/v1/auth/me", sessionAuth(http.HandlerFunc(s.meHandler)))
 	s.mux.Handle("PUT /api/v1/auth/project", sessionAuth(http.HandlerFunc(s.switchProjectHandler)))
@@ -291,6 +429,17 @@ func (s *Server) Start() error {
 	s.startAlertChecker()
 	s.startLeadPusher()
 	s.startEngagementPoller()
+	s.startSourceMonitor()
+	s.startRetentionCleanup()
+	s.startLeadScoreSnapshotter()
+	s.startICPAutoRefresh()
+	s.startExperimentAutoStop()
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		for range ticker.C {
+			s.eventLimiter.Cleanup(1 * time.Hour)
+		}
+	}()
 	return s.server.ListenAndServe()
 }
 
@@ -1038,8 +1187,31 @@ func (s *Server) evaluateFlagsHandler(w http.ResponseWriter, r *http.Request) {
 		h.Write([]byte(distinctID + ":" + f.ID))
 		result[f.Key] = int(h.Sum32()%100) < f.RolloutPercentage
 	}
+
+	// Enrich with experiment variant assignments.
+	experiments := make(map[string]any)
+	if expList, err := s.meta.ListExperiments(r.Context(), project.ID); err == nil {
+		for _, exp := range expList {
+			if exp.Status != "running" {
+				continue
+			}
+			var variants []string
+			json.Unmarshal([]byte(exp.Variants), &variants)
+			if len(variants) == 0 {
+				continue
+			}
+			h := fnv.New32a()
+			h.Write([]byte(distinctID + ":" + exp.FlagKey))
+			idx := int(h.Sum32()) % len(variants)
+			experiments[exp.FlagKey] = map[string]any{
+				"experiment_id": exp.ID,
+				"variant":       variants[idx],
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"flags": result})
+	json.NewEncoder(w).Encode(map[string]any{"flags": result, "experiments": experiments})
 }
 
 // --- Alert handlers ---
@@ -1233,33 +1405,34 @@ func (s *Server) deleteRefCodeHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- Connector handlers ---
+// --- Publisher handlers ---
 
-func (s *Server) listConnectorsHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listPublishersHandler(w http.ResponseWriter, r *http.Request) {
 	project := auth.ProjectFromContext(r.Context())
 	if project == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
-	connectors := s.registry.List()
-	result := make([]map[string]string, len(connectors))
-	for i, c := range connectors {
-		result[i] = map[string]string{"name": c.Name(), "display_name": c.DisplayName()}
+	publishers := s.registry.ListPublishers()
+	result := make([]map[string]string, len(publishers))
+	for i, p := range publishers {
+		result[i] = map[string]string{"name": p.Name(), "display_name": p.DisplayName()}
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// Return as "connectors" for frontend backward compat.
 	json.NewEncoder(w).Encode(map[string]any{"connectors": result})
 }
 
-func (s *Server) connectorPostHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) publisherPostHandler(w http.ResponseWriter, r *http.Request) {
 	project := auth.ProjectFromContext(r.Context())
 	if project == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 	name := r.PathValue("name")
-	c := s.registry.Get(name)
-	if c == nil {
-		http.Error(w, `{"error":"connector not found"}`, http.StatusNotFound)
+	p := s.registry.GetPublisher(name)
+	if p == nil {
+		http.Error(w, `{"error":"publisher not found"}`, http.StatusNotFound)
 		return
 	}
 	var body growth.PostContent
@@ -1267,7 +1440,7 @@ func (s *Server) connectorPostHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	result, err := c.Post(r.Context(), body)
+	result, err := p.Post(r.Context(), body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"post failed: %s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -1276,7 +1449,7 @@ func (s *Server) connectorPostHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-func (s *Server) connectorEngagementHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) publisherEngagementHandler(w http.ResponseWriter, r *http.Request) {
 	project := auth.ProjectFromContext(r.Context())
 	if project == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
@@ -1284,12 +1457,12 @@ func (s *Server) connectorEngagementHandler(w http.ResponseWriter, r *http.Reque
 	}
 	name := r.PathValue("name")
 	externalID := r.PathValue("externalID")
-	c := s.registry.Get(name)
-	if c == nil {
-		http.Error(w, `{"error":"connector not found"}`, http.StatusNotFound)
+	p := s.registry.GetPublisher(name)
+	if p == nil {
+		http.Error(w, `{"error":"publisher not found"}`, http.StatusNotFound)
 		return
 	}
-	metrics, err := c.FetchEngagement(r.Context(), externalID)
+	metrics, err := p.FetchEngagement(r.Context(), externalID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"fetch failed: %s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -1298,19 +1471,19 @@ func (s *Server) connectorEngagementHandler(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(metrics)
 }
 
-func (s *Server) connectorValidateHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) publisherValidateHandler(w http.ResponseWriter, r *http.Request) {
 	project := auth.ProjectFromContext(r.Context())
 	if project == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 	name := r.PathValue("name")
-	c := s.registry.Get(name)
-	if c == nil {
-		http.Error(w, `{"error":"connector not found"}`, http.StatusNotFound)
+	p := s.registry.GetPublisher(name)
+	if p == nil {
+		http.Error(w, `{"error":"publisher not found"}`, http.StatusNotFound)
 		return
 	}
-	if err := c.Validate(r.Context()); err != nil {
+	if err := p.Validate(r.Context()); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"valid": false, "error": err.Error()})
 		return
@@ -1332,8 +1505,38 @@ func (s *Server) listCampaignsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 		return
 	}
+
+	// Build a map from ref code string → campaign ID to join stats from DuckDB.
+	refCodes, _ := s.meta.ListRefCodes(r.Context(), project.ID)
+	refCodeByID := make(map[string]string, len(refCodes)) // ref_code_id → code string
+	for _, rc := range refCodes {
+		refCodeByID[rc.ID] = rc.Code
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-30 * 24 * time.Hour)
+	batchStats, _ := s.events.QueryRefCodeStatsBatch(r.Context(), project.ID, start, now)
+
+	// Build campaign_id → CampaignStats by matching ref code strings.
+	campaignStats := make(map[string]storage.CampaignStats)
+	for _, c := range campaigns {
+		if c.RefCodeID == "" {
+			continue
+		}
+		code, ok := refCodeByID[c.RefCodeID]
+		if !ok || code == "" {
+			continue
+		}
+		if s, ok := batchStats[code]; ok {
+			campaignStats[c.ID] = s
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"campaigns": campaigns})
+	json.NewEncoder(w).Encode(map[string]any{
+		"campaigns": campaigns,
+		"stats":     campaignStats,
+	})
 }
 
 func (s *Server) createCampaignHandler(w http.ResponseWriter, r *http.Request) {
@@ -1400,15 +1603,16 @@ func (s *Server) updateCampaignHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	var body struct {
-		Name    string `json:"name"`
-		Status  string `json:"status"`
-		Content string `json:"content"`
+		Name    string  `json:"name"`
+		Status  string  `json:"status"`
+		Content string  `json:"content"`
+		Cost    float64 `json:"cost"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	if err := s.meta.UpdateCampaign(r.Context(), project.ID, id, body.Name, body.Status, body.Content); err != nil {
+	if err := s.meta.UpdateCampaign(r.Context(), project.ID, id, body.Name, body.Status, body.Content, body.Cost); err != nil {
 		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
 		return
 	}
@@ -1435,6 +1639,14 @@ func (s *Server) generateCampaignHandler(w http.ResponseWriter, r *http.Request)
 	if project == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
+	}
+	if s.config.ResourceLimitFn != nil {
+		if code, msg := s.config.ResourceLimitFn(r.Context(), project.ID, "campaigns"); code != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			json.NewEncoder(w).Encode(map[string]any{"error": msg, "upgrade_required": true})
+			return
+		}
 	}
 	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
 	if err != nil || cfg.Provider == "" {
@@ -1590,10 +1802,138 @@ func (s *Server) abTestHandler(w http.ResponseWriter, r *http.Request) {
 		"original":   original,
 		"variations": results,
 	})
-	_ = s.meta.UpdateCampaign(r.Context(), project.ID, campaignID, campaign.Name, campaign.Status, string(updatedContent))
+	_ = s.meta.UpdateCampaign(r.Context(), project.ID, campaignID, campaign.Name, campaign.Status, string(updatedContent), campaign.Cost)
+
+	// Create an Experiment record linking to the campaign's base flag key.
+	baseFlagKey := fmt.Sprintf("ab_campaign_%s", campaignID[:8])
+	variantNames := []string{"original"}
+	for i := range variations {
+		variantNames = append(variantNames, fmt.Sprintf("v%d", i+1))
+	}
+	variantsJSON, _ := json.Marshal(variantNames)
+	expID, _ := generateID()
+	_ = s.meta.CreateExperiment(r.Context(), storage.Experiment{
+		ID:        expID,
+		ProjectID: project.ID,
+		Name:      "A/B: " + campaign.Name,
+		FlagKey:   baseFlagKey,
+		Variants:  string(variantsJSON),
+		Status:    "running",
+	})
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"variations": results})
+	json.NewEncoder(w).Encode(map[string]any{"variations": results, "experiment_id": expID})
+}
+
+func (s *Server) campaignPerformanceHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	campaignID := r.PathValue("id")
+	campaign, err := s.meta.GetCampaign(r.Context(), project.ID, campaignID)
+	if err != nil {
+		http.Error(w, `{"error":"campaign not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Look up ref code to get the code string.
+	var refCode string
+	if campaign.RefCodeID != "" {
+		rc, err := s.meta.GetRefCode(r.Context(), project.ID, campaign.RefCodeID)
+		if err == nil {
+			refCode = rc.Code
+		}
+	}
+
+	result := map[string]any{
+		"campaign": campaign,
+		"ref_code": refCode,
+	}
+
+	if refCode != "" {
+		now := time.Now().UTC()
+		start := now.Add(-30 * 24 * time.Hour)
+		if v := r.URL.Query().Get("start"); v != "" {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				start = t
+			}
+		}
+		end := now
+		if v := r.URL.Query().Get("end"); v != "" {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				end = t
+			}
+		}
+
+		stats, err := s.events.QueryCampaignStats(r.Context(), project.ID, refCode, start, end)
+		if err == nil {
+			result["stats"] = stats
+		}
+
+		timeSeries, err := s.events.QueryCampaignTimeSeries(r.Context(), project.ID, refCode, start, end)
+		if err == nil {
+			result["time_series"] = timeSeries
+		}
+
+		// Channel breakdown: how traffic arrived at this campaign.
+		if channels, err := s.events.QueryCampaignChannelBreakdown(r.Context(), project.ID, refCode, start, end); err == nil {
+			result["channels"] = channels
+		}
+
+		// Conversion event counting: if caller specifies a conversion event, count matching sessions.
+		if convEvent := r.URL.Query().Get("conversion_event"); convEvent != "" {
+			count, err := s.events.QueryCampaignConversions(r.Context(), project.ID, refCode, convEvent, start, end)
+			if err == nil && stats != nil && stats.Sessions > 0 {
+				result["conversion_count"] = count
+				result["conversion_rate"] = float64(count) / float64(stats.Sessions) * 100
+				result["conversion_event"] = convEvent
+			} else if err == nil {
+				result["conversion_count"] = count
+				result["conversion_rate"] = 0.0
+				result["conversion_event"] = convEvent
+			}
+		}
+	}
+
+	// Revenue query: if a conversion_goal_id is specified, compute revenue and ROI.
+	if goalID := r.URL.Query().Get("conversion_goal_id"); goalID != "" && refCode != "" {
+		goal, err := s.meta.GetConversionGoal(r.Context(), project.ID, goalID)
+		if err == nil {
+			now := time.Now().UTC()
+			start := now.Add(-30 * 24 * time.Hour)
+			end := now
+			criteria := storage.GoalCriteria{
+				EventType:     goal.EventType,
+				EventName:     goal.EventName,
+				URLPattern:    goal.URLPattern,
+				ValueProperty: goal.ValueProperty,
+			}
+			overview, err := s.events.QueryRevenueOverview(r.Context(), project.ID, criteria, start, end)
+			if err == nil {
+				result["revenue"] = overview.TotalRevenue
+				if campaign.Cost > 0 {
+					result["roi"] = (overview.TotalRevenue - campaign.Cost) / campaign.Cost * 100
+				}
+			}
+		}
+	}
+
+	// Include engagement data from campaign posts.
+	posts, err := s.meta.ListCampaignPosts(r.Context(), project.ID)
+	if err == nil {
+		var campaignPosts []storage.CampaignPost
+		for _, p := range posts {
+			if p.CampaignID == campaignID {
+				campaignPosts = append(campaignPosts, p)
+			}
+		}
+		result["posts"] = campaignPosts
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 // --- ICP handler ---
@@ -1652,11 +1992,72 @@ func (s *Server) icpAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Auto-save the analysis.
+	analysisID, _ := generateID()
+	pagesJSON, _ := json.Marshal(body.ConversionPaths)
+	traitsJSON, _ := json.Marshal(analysis.CommonTraits)
+	channelsJSON, _ := json.Marshal(analysis.BestChannels)
+	recsJSON, _ := json.Marshal(analysis.Recommendations)
+	_ = s.meta.CreateICPAnalysis(r.Context(), storage.ICPAnalysis{
+		ID:              analysisID,
+		ProjectID:       project.ID,
+		ConversionPages: string(pagesJSON),
+		Summary:         analysis.Summary,
+		Traits:          string(traitsJSON),
+		Channels:        string(channelsJSON),
+		Recommendations: string(recsJSON),
+		ProfileCount:    len(profiles),
+	})
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"analysis": analysis,
-		"profiles": profiles,
+		"analysis":    analysis,
+		"profiles":    profiles,
+		"analysis_id": analysisID,
 	})
+}
+
+func (s *Server) listICPAnalysesHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	analyses, err := s.meta.ListICPAnalyses(r.Context(), project.ID, 20)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"analyses": analyses})
+}
+
+func (s *Server) getICPAnalysisHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	a, err := s.meta.GetICPAnalysis(r.Context(), project.ID, r.PathValue("id"))
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(a)
+}
+
+func (s *Server) deleteICPAnalysisHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	if err := s.meta.DeleteICPAnalysis(r.Context(), project.ID, r.PathValue("id")); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Engagement poller ---
@@ -1682,11 +2083,11 @@ func (s *Server) pollEngagement(ctx context.Context) {
 			continue
 		}
 		for _, post := range posts {
-			c := s.registry.Get(post.ConnectorName)
-			if c == nil {
+			p := s.registry.GetPublisher(post.ConnectorName)
+			if p == nil {
 				continue
 			}
-			metrics, err := c.FetchEngagement(ctx, post.ExternalID)
+			metrics, err := p.FetchEngagement(ctx, post.ExternalID)
 			if err != nil {
 				log.Printf("WARN engagement poller: fetch failed for post %s: %v", post.ID, err)
 				continue
@@ -1820,9 +2221,10 @@ func (s *Server) createCRMWebhookHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var body struct {
-		Name       string `json:"name"`
-		WebhookURL string `json:"webhook_url"`
-		MinScore   int    `json:"min_score"`
+		Name            string `json:"name"`
+		WebhookURL      string `json:"webhook_url"`
+		MinScore        int    `json:"min_score"`
+		PayloadTemplate string `json:"payload_template"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" || body.WebhookURL == "" {
 		http.Error(w, `{"error":"name and webhook_url are required"}`, http.StatusBadRequest)
@@ -1833,13 +2235,16 @@ func (s *Server) createCRMWebhookHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 		return
 	}
+	secret, _ := generateID()
 	wh := storage.CRMWebhook{
-		ID:         id,
-		ProjectID:  project.ID,
-		Name:       body.Name,
-		WebhookURL: body.WebhookURL,
-		MinScore:   body.MinScore,
-		Enabled:    true,
+		ID:              id,
+		ProjectID:       project.ID,
+		Name:            body.Name,
+		WebhookURL:      body.WebhookURL,
+		MinScore:        body.MinScore,
+		Enabled:         true,
+		Secret:          secret,
+		PayloadTemplate: body.PayloadTemplate,
 	}
 	if err := s.meta.CreateCRMWebhook(r.Context(), wh); err != nil {
 		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
@@ -1858,16 +2263,18 @@ func (s *Server) updateCRMWebhookHandler(w http.ResponseWriter, r *http.Request)
 	}
 	id := r.PathValue("id")
 	var body struct {
-		Name       string `json:"name"`
-		WebhookURL string `json:"webhook_url"`
-		MinScore   int    `json:"min_score"`
-		Enabled    bool   `json:"enabled"`
+		Name            string `json:"name"`
+		WebhookURL      string `json:"webhook_url"`
+		MinScore        int    `json:"min_score"`
+		Enabled         bool   `json:"enabled"`
+		Secret          string `json:"secret"`
+		PayloadTemplate string `json:"payload_template"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	if err := s.meta.UpdateCRMWebhook(r.Context(), project.ID, id, body.Name, body.WebhookURL, body.MinScore, body.Enabled); err != nil {
+	if err := s.meta.UpdateCRMWebhook(r.Context(), project.ID, id, body.Name, body.WebhookURL, body.MinScore, body.Enabled, body.Secret, body.PayloadTemplate); err != nil {
 		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
 		return
 	}
@@ -2036,17 +2443,14 @@ func (s *Server) pushLeads(ctx context.Context) {
 	for _, wh := range webhooks {
 		rules, err := s.meta.ListScoringRules(ctx, wh.ProjectID)
 		if err != nil {
-			log.Printf("WARN lead pusher: failed to load rules for project %s: %v", wh.ProjectID, err)
 			continue
 		}
 		now := time.Now().UTC()
 		start := now.Add(-30 * 24 * time.Hour)
 		leads, _, err := s.events.QueryLeadScores(ctx, wh.ProjectID, rules, start, now, 100, 0)
 		if err != nil {
-			log.Printf("WARN lead pusher: failed to query leads for project %s: %v", wh.ProjectID, err)
 			continue
 		}
-		// Filter by min score.
 		var qualified []storage.ScoredLead
 		for _, l := range leads {
 			if l.Score >= wh.MinScore {
@@ -2056,26 +2460,463 @@ func (s *Server) pushLeads(ctx context.Context) {
 		if len(qualified) == 0 {
 			continue
 		}
-		payload, _ := json.Marshal(map[string]any{
-			"project_id": wh.ProjectID,
-			"webhook":    wh.Name,
-			"leads":      qualified,
-		})
+		payload := buildWebhookPayload(wh, qualified)
+		s.deliverWebhook(ctx, wh, payload, len(qualified))
+		_ = s.meta.UpdateCRMWebhookPushed(ctx, wh.ID, now)
+	}
+}
+
+func (s *Server) deliverWebhook(ctx context.Context, wh storage.CRMWebhook, payload []byte, leadCount int) {
+	backoffs := []time.Duration{0, 60 * time.Second, 5 * time.Minute}
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(backoffs[attempt-1])
+		}
 		req, err := http.NewRequestWithContext(ctx, "POST", wh.WebhookURL, bytes.NewReader(payload))
 		if err != nil {
-			log.Printf("WARN lead pusher: failed to build request for webhook %s: %v", wh.Name, err)
+			s.logDelivery(ctx, wh, leadCount, 0, "", err.Error(), false, attempt)
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("WARN lead pusher: webhook %s delivery failed: %v", wh.Name, err)
-		} else {
-			resp.Body.Close()
-			log.Printf("INFO lead pusher: pushed %d leads to webhook %s", len(qualified), wh.Name)
+		if sig := signPayload(wh.Secret, payload); sig != "" {
+			req.Header.Set("X-ClickNest-Signature", sig)
 		}
-		if err := s.meta.UpdateCRMWebhookPushed(ctx, wh.ID, now); err != nil {
-			log.Printf("WARN lead pusher: failed to update last_pushed_at: %v", err)
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			s.logDelivery(ctx, wh, leadCount, 0, "", err.Error(), false, attempt)
+			continue
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		resp.Body.Close()
+		success := resp.StatusCode >= 200 && resp.StatusCode < 300
+		s.logDelivery(ctx, wh, leadCount, resp.StatusCode, string(bodyBytes), "", success, attempt)
+		if success {
+			log.Printf("INFO lead pusher: pushed %d leads to webhook %s (attempt %d)", leadCount, wh.Name, attempt)
+			return
+		}
+	}
+	log.Printf("WARN lead pusher: webhook %s failed after 3 attempts", wh.Name)
+}
+
+func (s *Server) logDelivery(ctx context.Context, wh storage.CRMWebhook, leadCount, statusCode int, respBody, errMsg string, success bool, attempt int) {
+	id, _ := generateID()
+	_ = s.meta.CreateWebhookDelivery(ctx, storage.WebhookDelivery{
+		ID:           id,
+		WebhookID:    wh.ID,
+		ProjectID:    wh.ProjectID,
+		LeadCount:    leadCount,
+		StatusCode:   statusCode,
+		ResponseBody: respBody,
+		Error:        errMsg,
+		Success:      success,
+		Attempt:      attempt,
+	})
+}
+
+func signPayload(secret string, payload []byte) string {
+	if secret == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) webhookDeliveriesHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	deliveries, err := s.meta.ListWebhookDeliveries(r.Context(), project.ID, r.PathValue("id"), 50)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"deliveries": deliveries})
+}
+
+// scoreRelevance computes a keyword overlap ratio [0,1] for a piece of content.
+// A score of 0.5 is returned when no keywords are configured.
+func scoreRelevance(content, title string, keywords []string) float64 {
+	if len(keywords) == 0 {
+		return 0.5
+	}
+	text := strings.ToLower(content + " " + title)
+	matched := 0
+	for _, kw := range keywords {
+		if strings.Contains(text, strings.ToLower(kw)) {
+			matched++
+		}
+	}
+	return float64(matched) / float64(len(keywords))
+}
+
+// --- Campaign publish / engagement ---
+
+func (s *Server) publishCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	campaignID := r.PathValue("id")
+	campaign, err := s.meta.GetCampaign(r.Context(), project.ID, campaignID)
+	if err != nil {
+		http.Error(w, `{"error":"campaign not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var body struct {
+		PublisherName   string `json:"publisher_name"`
+		ContentOverride string `json:"content_override"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.PublisherName == "" {
+		http.Error(w, `{"error":"publisher_name required"}`, http.StatusBadRequest)
+		return
+	}
+	pub := s.registry.GetPublisher(body.PublisherName)
+	if pub == nil {
+		http.Error(w, `{"error":"publisher not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var cc struct {
+		Title string   `json:"title"`
+		Body  string   `json:"body"`
+		URL   string   `json:"url"`
+		Tags  []string `json:"tags"`
+	}
+	_ = json.Unmarshal([]byte(campaign.Content), &cc)
+
+	postBody := cc.Body
+	if body.ContentOverride != "" {
+		postBody = body.ContentOverride
+	}
+
+	if campaign.RefCodeID != "" {
+		if rc, err := s.meta.GetRefCode(r.Context(), project.ID, campaign.RefCodeID); err == nil && rc.Code != "" {
+			if cc.URL != "" && !strings.Contains(postBody, "?ref=") {
+				postBody += "\n\n" + cc.URL + "?ref=" + rc.Code
+			}
+		}
+	}
+
+	result, err := pub.Post(r.Context(), growth.PostContent{
+		Title:       cc.Title,
+		Body:        postBody,
+		Channel:     campaign.Channel,
+		Tags:        cc.Tags,
+		ExtraFields: sourceCredentialFields(s.meta, r.Context(), project.ID, body.PublisherName),
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"publish failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	postID, _ := generateID()
+	_ = s.meta.CreateCampaignPost(r.Context(), storage.CampaignPost{
+		ID:             postID,
+		CampaignID:     campaignID,
+		ProjectID:      project.ID,
+		ConnectorName:  body.PublisherName,
+		ExternalID:     result.ExternalID,
+		ExternalURL:    result.ExternalURL,
+		PostedAt:       time.Now().UTC(),
+		LastEngagement: "{}",
+	})
+	_ = s.meta.UpdateCampaign(r.Context(), project.ID, campaignID, campaign.Name, "published", campaign.Content, campaign.Cost)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func (s *Server) refreshCampaignEngagementHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	campaignID := r.PathValue("id")
+	posts, err := s.meta.ListCampaignPosts(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	refreshed := 0
+	for _, p := range posts {
+		if p.CampaignID != campaignID || p.ExternalID == "" {
+			continue
+		}
+		pub := s.registry.GetPublisher(p.ConnectorName)
+		if pub == nil {
+			continue
+		}
+		metrics, err := pub.FetchEngagement(r.Context(), p.ExternalID)
+		if err != nil {
+			log.Printf("WARN refresh engagement post %s: %v", p.ID, err)
+			continue
+		}
+		engJSON, _ := json.Marshal(metrics)
+		_ = s.meta.UpdateCampaignPostEngagement(r.Context(), p.ID, string(engJSON), time.Now().UTC())
+		refreshed++
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"refreshed": refreshed})
+}
+
+// --- Webhook delivery retry ---
+
+func (s *Server) retryWebhookDeliveryHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	webhookID := r.PathValue("id")
+	webhooks, err := s.meta.ListCRMWebhooks(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	var wh *storage.CRMWebhook
+	for i, w := range webhooks {
+		if w.ID == webhookID {
+			wh = &webhooks[i]
+			break
+		}
+	}
+	if wh == nil {
+		http.Error(w, `{"error":"webhook not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Fire the webhook immediately with an empty lead list as a retry probe.
+	payload, _ := json.Marshal(map[string]any{
+		"webhook":   wh.Name,
+		"leads":     []any{},
+		"retry":     true,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, wh.WebhookURL, bytes.NewReader(payload))
+	if err != nil {
+		http.Error(w, `{"error":"failed to create request"}`, http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if sig := signPayload(wh.Secret, payload); sig != "" {
+		req.Header.Set("X-ClickNest-Signature", sig)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	var statusCode int
+	var respBody string
+	success := false
+	if err == nil {
+		statusCode = resp.StatusCode
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		respBody = string(b)
+		success = statusCode >= 200 && statusCode < 300
+	}
+
+	dlvID, _ := generateID()
+	_ = s.meta.CreateWebhookDelivery(r.Context(), storage.WebhookDelivery{
+		ID:           dlvID,
+		WebhookID:    wh.ID,
+		ProjectID:    project.ID,
+		LeadCount:    0,
+		StatusCode:   statusCode,
+		ResponseBody: respBody,
+		Success:      success,
+		Attempt:      1,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"success": success, "status_code": statusCode})
+}
+
+// --- ICP → action handlers ---
+
+func (s *Server) icpGenerateCampaignHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	if s.config.ResourceLimitFn != nil {
+		if code, msg := s.config.ResourceLimitFn(r.Context(), project.ID, "campaigns"); code != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			json.NewEncoder(w).Encode(map[string]any{"error": msg, "upgrade_required": true})
+			return
+		}
+	}
+
+	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
+	if err != nil || cfg.Provider == "" {
+		http.Error(w, `{"error":"LLM not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	analysis, err := s.meta.GetICPAnalysis(r.Context(), project.ID, r.PathValue("id"))
+	if err != nil {
+		http.Error(w, `{"error":"analysis not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var body struct {
+		Channel string `json:"channel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Channel == "" {
+		body.Channel = "reddit"
+	}
+
+	var traits []string
+	_ = json.Unmarshal([]byte(analysis.Traits), &traits)
+
+	now := time.Now().UTC()
+	monthAgo := now.Add(-30 * 24 * time.Hour)
+	topPages, _ := s.events.QueryTopPages(r.Context(), project.ID, monthAgo, now, 10)
+	topEvents, _ := s.events.QueryTopEventNames(r.Context(), project.ID, monthAgo, now, 10)
+
+	proj, _ := s.meta.GetProject(r.Context(), project.ID)
+	projectDesc := ""
+	if proj != nil {
+		projectDesc = proj.Description
+	}
+
+	refCodeID, _ := generateID()
+	refCode := fmt.Sprintf("icp_%s", refCodeID[:8])
+	_ = s.meta.CreateRefCode(r.Context(), storage.RefCode{
+		ID:        refCodeID,
+		ProjectID: project.ID,
+		Code:      refCode,
+		Name:      fmt.Sprintf("ICP Campaign (%s)", body.Channel),
+	})
+
+	cc := ai.CampaignContext{
+		ProjectDescription: projectDesc,
+		TopPages:           topPages,
+		TopEvents:          topEvents,
+		Channel:            body.Channel,
+		Topic:              "our ideal customers: " + strings.Join(traits, ", "),
+		RefURL:             "?ref=" + refCode,
+		ICPTraits:          strings.Join(traits, "; "),
+	}
+
+	content, err := ai.GenerateCampaign(r.Context(), cfg, cc)
+	if err != nil {
+		http.Error(w, `{"error":"AI generation failed: `+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+
+	contentJSON, _ := json.Marshal(content)
+	campaignID, _ := generateID()
+	campaign := storage.Campaign{
+		ID:        campaignID,
+		ProjectID: project.ID,
+		Name:      content.Title,
+		Channel:   body.Channel,
+		RefCodeID: refCodeID,
+		Status:    "draft",
+		Content:   string(contentJSON),
+		AIPrompt:  "ICP-derived: " + analysis.Summary,
+	}
+	if err := s.meta.CreateCampaign(r.Context(), campaign); err != nil {
+		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"campaign": campaign,
+		"content":  content,
+		"ref_code": refCode,
+	})
+}
+
+func (s *Server) icpCreateScoringRulesHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	analysis, err := s.meta.GetICPAnalysis(r.Context(), project.ID, r.PathValue("id"))
+	if err != nil {
+		http.Error(w, `{"error":"analysis not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var convPages []string
+	_ = json.Unmarshal([]byte(analysis.ConversionPages), &convPages)
+
+	created := 0
+	for _, page := range convPages {
+		ruleID, _ := generateID()
+		config, _ := json.Marshal(map[string]string{"url_path": page})
+		err := s.meta.CreateScoringRule(r.Context(), storage.ScoringRule{
+			ID:        ruleID,
+			ProjectID: project.ID,
+			Name:      "ICP: Visited " + page,
+			RuleType:  "page_visit",
+			Config:    string(config),
+			Points:    25,
+			Enabled:   true,
+		})
+		if err == nil {
+			created++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"created": created})
+}
+
+// --- Retention cleanup ---
+
+func (s *Server) startRetentionCleanup() {
+	go func() {
+		time.Sleep(5 * time.Minute)
+		s.runRetentionCleanup(context.Background())
+		ticker := time.NewTicker(24 * time.Hour)
+		for range ticker.C {
+			s.runRetentionCleanup(context.Background())
+		}
+	}()
+}
+
+func (s *Server) runRetentionCleanup(ctx context.Context) {
+	projects, err := s.meta.ListProjects(ctx)
+	if err != nil {
+		log.Printf("WARN retention cleanup: failed to list projects: %v", err)
+		return
+	}
+	for _, proj := range projects {
+		var cutoff time.Time
+		if s.config.RetentionDaysFn != nil {
+			days := s.config.RetentionDaysFn(ctx, proj.ID)
+			if days < 0 {
+				continue // unlimited retention for this project
+			}
+			cutoff = time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
+		} else {
+			cutoff = time.Now().UTC().Add(-365 * 24 * time.Hour)
+		}
+		deleted, err := s.events.DeleteOldEvents(ctx, proj.ID, cutoff)
+		if err != nil {
+			log.Printf("WARN retention cleanup: failed for project %s: %v", proj.ID, err)
+			continue
+		}
+		if deleted > 0 {
+			log.Printf("INFO retention cleanup: deleted %d events from project %s", deleted, proj.ID)
 		}
 	}
 }
@@ -2118,12 +2959,1651 @@ func (s *Server) storageHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(info)
 }
 
+// --- Conversion Goal handlers ---
+
+func (s *Server) listConversionGoalsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	goals, err := s.meta.ListConversionGoals(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"goals": goals})
+}
+
+func (s *Server) createConversionGoalHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Name          string `json:"name"`
+		EventType     string `json:"event_type"`
+		EventName     string `json:"event_name"`
+		URLPattern    string `json:"url_pattern"`
+		ValueProperty string `json:"value_property"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+		http.Error(w, `{"error":"name is required"}`, http.StatusBadRequest)
+		return
+	}
+	id, err := generateID()
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if body.EventType == "" {
+		body.EventType = "custom"
+	}
+	if body.ValueProperty == "" {
+		body.ValueProperty = "$value"
+	}
+	goal := storage.ConversionGoal{
+		ID:            id,
+		ProjectID:     project.ID,
+		Name:          body.Name,
+		EventType:     body.EventType,
+		EventName:     body.EventName,
+		URLPattern:    body.URLPattern,
+		ValueProperty: body.ValueProperty,
+	}
+	if err := s.meta.CreateConversionGoal(r.Context(), goal); err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(goal)
+}
+
+func (s *Server) getConversionGoalHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	goal, err := s.meta.GetConversionGoal(r.Context(), project.ID, id)
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(goal)
+}
+
+func (s *Server) updateConversionGoalHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Name          string `json:"name"`
+		EventType     string `json:"event_type"`
+		EventName     string `json:"event_name"`
+		URLPattern    string `json:"url_pattern"`
+		ValueProperty string `json:"value_property"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateConversionGoal(r.Context(), project.ID, id, storage.ConversionGoal{
+		Name:          body.Name,
+		EventType:     body.EventType,
+		EventName:     body.EventName,
+		URLPattern:    body.URLPattern,
+		ValueProperty: body.ValueProperty,
+	}); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) deleteConversionGoalHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteConversionGoal(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Experiment handlers ---
+
+func (s *Server) listExperimentsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	experiments, err := s.meta.ListExperiments(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"experiments": experiments})
+}
+
+func (s *Server) createExperimentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Name             string   `json:"name"`
+		FlagKey          string   `json:"flag_key"`
+		Variants         []string `json:"variants"`
+		ConversionGoalID string   `json:"conversion_goal_id"`
+		AutoStop         bool     `json:"auto_stop"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" || body.FlagKey == "" {
+		http.Error(w, `{"error":"name and flag_key are required"}`, http.StatusBadRequest)
+		return
+	}
+	if len(body.Variants) < 2 {
+		http.Error(w, `{"error":"at least 2 variants required"}`, http.StatusBadRequest)
+		return
+	}
+	id, err := generateID()
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	variantsJSON, _ := json.Marshal(body.Variants)
+	exp := storage.Experiment{
+		ID:               id,
+		ProjectID:        project.ID,
+		Name:             body.Name,
+		FlagKey:          body.FlagKey,
+		Variants:         string(variantsJSON),
+		ConversionGoalID: body.ConversionGoalID,
+		Status:           "running",
+		AutoStop:         body.AutoStop,
+	}
+	if err := s.meta.CreateExperiment(r.Context(), exp); err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(exp)
+}
+
+func (s *Server) getExperimentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	exp, err := s.meta.GetExperiment(r.Context(), project.ID, id)
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(exp)
+}
+
+func (s *Server) updateExperimentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Name             string `json:"name"`
+		Status           string `json:"status"`
+		AutoStop         bool   `json:"auto_stop"`
+		ConversionGoalID string `json:"conversion_goal_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateExperiment(r.Context(), project.ID, id, body.Name, body.Status, body.AutoStop, body.ConversionGoalID); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) deleteExperimentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteExperiment(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) stopExperimentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.EndExperiment(r.Context(), project.ID, id, ""); err != nil {
+		http.Error(w, `{"error":"stop failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
+}
+
+func (s *Server) declareWinnerHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	var body struct {
+		Variant string `json:"variant"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Variant == "" {
+		http.Error(w, `{"error":"variant is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	exp, err := s.meta.GetExperiment(r.Context(), project.ID, id)
+	if err != nil {
+		http.Error(w, `{"error":"experiment not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// End the experiment with the winner.
+	if err := s.meta.EndExperiment(r.Context(), project.ID, id, body.Variant); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Roll out the winning variant by setting the experiment's flag to 100%.
+	flags, _ := s.meta.ListFeatureFlags(r.Context(), project.ID)
+	for _, f := range flags {
+		if f.Key == exp.FlagKey {
+			_ = s.meta.UpdateFeatureFlag(r.Context(), project.ID, f.ID, true, 100)
+			break
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "winner_declared", "winner": body.Variant})
+}
+
+// --- Experiment auto-stop background job ---
+
+func (s *Server) startExperimentAutoStop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	go func() {
+		for range ticker.C {
+			s.checkExperimentAutoStop(context.Background())
+		}
+	}()
+}
+
+func (s *Server) checkExperimentAutoStop(ctx context.Context) {
+	// List all projects and check their experiments.
+	projects, err := s.meta.ListProjects(ctx)
+	if err != nil {
+		return
+	}
+	for _, p := range projects {
+		experiments, err := s.meta.ListExperiments(ctx, p.ID)
+		if err != nil {
+			continue
+		}
+		for _, exp := range experiments {
+			if exp.Status != "running" || !exp.AutoStop {
+				continue
+			}
+
+			var variants []string
+			json.Unmarshal([]byte(exp.Variants), &variants)
+			if len(variants) < 2 {
+				continue
+			}
+
+			start := exp.StartedAt
+			end := time.Now().UTC()
+
+			results, err := s.events.QueryExperimentResults(ctx, p.ID, exp.FlagKey, variants, nil, start, end)
+			if err != nil || len(results) < 2 {
+				continue
+			}
+
+			// Check minimum sample: at least 100 exposures per variant.
+			minExposures := results[0].Exposures
+			for _, v := range results[1:] {
+				if v.Exposures < minExposures {
+					minExposures = v.Exposures
+				}
+			}
+			if minExposures < 100 {
+				continue
+			}
+
+			// Check statistical significance.
+			significant := false
+			if len(results) == 2 {
+				pVal := zTestPValue(results[0].Conversions, results[0].Exposures, results[1].Conversions, results[1].Exposures)
+				significant = pVal < 0.05
+			}
+			if !significant {
+				continue
+			}
+
+			// Find the winner (highest conversion rate).
+			bestVariant := results[0].Variant
+			bestRate := results[0].ConversionRate
+			for _, v := range results[1:] {
+				if v.ConversionRate > bestRate {
+					bestRate = v.ConversionRate
+					bestVariant = v.Variant
+				}
+			}
+
+			_ = s.meta.EndExperiment(ctx, p.ID, exp.ID, bestVariant)
+			log.Printf("Experiment auto-stopped: %s (winner: %s, rate: %.2f%%)", exp.Name, bestVariant, bestRate)
+		}
+	}
+}
+
+// zTestPValue returns the two-tailed p-value for a Z-test comparing two proportions.
+func zTestPValue(cA, nA, cB, nB int64) float64 {
+	if nA <= 0 || nB <= 0 {
+		return 1
+	}
+	p1 := float64(cA) / float64(nA)
+	p2 := float64(cB) / float64(nB)
+	pPooled := float64(cA+cB) / float64(nA+nB)
+	se := math.Sqrt(pPooled * (1 - pPooled) * (1.0/float64(nA) + 1.0/float64(nB)))
+	if se == 0 {
+		return 1
+	}
+	z := (p1 - p2) / se
+	return math.Erfc(math.Abs(z) / math.Sqrt2)
+}
+
 func generateID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// --- Source handlers ---
+
+func (s *Server) listSourcesHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	sources := s.registry.ListSources()
+	result := make([]map[string]string, len(sources))
+	for i, src := range sources {
+		result[i] = map[string]string{"name": src.Name(), "display_name": src.DisplayName()}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"sources": result})
+}
+
+func (s *Server) triggerSourceSearchHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+	src := s.registry.GetSource(name)
+	if src == nil {
+		http.Error(w, `{"error":"source not found"}`, http.StatusNotFound)
+		return
+	}
+
+	cfg, err := s.meta.GetSourceConfig(r.Context(), project.ID, name)
+	if err != nil {
+		http.Error(w, `{"error":"source not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	var keywords []string
+	_ = json.Unmarshal([]byte(cfg.Keywords), &keywords)
+
+	mentions, err := src.Search(r.Context(), growth.SearchQuery{
+		Keywords:    keywords,
+		MaxResults:  25,
+		ExtraFields: sourceCredentialFields(s.meta, r.Context(), project.ID, name),
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"search failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	count := 0
+	for _, m := range mentions {
+		id, _ := generateID()
+		_ = s.meta.UpsertMention(r.Context(), storage.MentionRecord{
+			ID:             id,
+			ProjectID:      project.ID,
+			SourceName:     name,
+			ExternalID:     m.ExternalID,
+			ExternalURL:    m.ExternalURL,
+			Author:         m.Author,
+			Title:          m.Title,
+			Content:        m.Content,
+			RelevanceScore: scoreRelevance(m.Content, m.Title, keywords),
+			ParentID:       m.ParentID,
+			Metadata:       "{}",
+			PostedAt:       &m.PostedAt,
+		})
+		count++
+	}
+
+	_ = s.meta.UpdateSourceConfigLastRun(r.Context(), project.ID, name, time.Now().UTC())
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"found": count})
+}
+
+// --- Source config handlers ---
+
+func (s *Server) listSourceConfigsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	configs, err := s.meta.ListSourceConfigs(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"list failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"configs": configs})
+}
+
+func (s *Server) upsertSourceConfigHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		SourceName      string   `json:"source_name"`
+		Keywords        []string `json:"keywords"`
+		ScheduleMinutes int      `json:"schedule_minutes"`
+		Enabled         bool     `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.SourceName == "" {
+		http.Error(w, `{"error":"source_name required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.ScheduleMinutes <= 0 {
+		body.ScheduleMinutes = 60
+	}
+
+	// Enforce connector limits before enabling a source.
+	if body.Enabled && s.config.ResourceLimitFn != nil {
+		if code, msg := s.config.ResourceLimitFn(r.Context(), project.ID, "connectors"); code != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			json.NewEncoder(w).Encode(map[string]any{"error": msg, "upgrade_required": true})
+			return
+		}
+	}
+
+	kwJSON, _ := json.Marshal(body.Keywords)
+	id, _ := generateID()
+	err := s.meta.UpsertSourceConfig(r.Context(), storage.SourceConfig{
+		ID:              id,
+		ProjectID:       project.ID,
+		SourceName:      body.SourceName,
+		Keywords:        string(kwJSON),
+		Filters:         "{}",
+		ScheduleMinutes: body.ScheduleMinutes,
+		Enabled:         body.Enabled,
+	})
+	if err != nil {
+		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// --- Mention handlers ---
+
+func (s *Server) listMentionsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	status := r.URL.Query().Get("status")
+	source := r.URL.Query().Get("source")
+	limit := 50
+	offset := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		fmt.Sscanf(v, "%d", &offset)
+	}
+	mentions, total, err := s.meta.ListMentions(r.Context(), project.ID, status, source, limit, offset)
+	if err != nil {
+		http.Error(w, `{"error":"list failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"mentions": mentions, "total": total})
+}
+
+func (s *Server) getMentionHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	m, err := s.meta.GetMention(r.Context(), project.ID, r.PathValue("id"))
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(m)
+}
+
+func (s *Server) updateMentionHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	switch body.Status {
+	case "new", "reviewed", "replied", "dismissed", "lead":
+	default:
+		http.Error(w, `{"error":"invalid status"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.meta.UpdateMentionStatus(r.Context(), project.ID, r.PathValue("id"), body.Status); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (s *Server) draftMentionReplyHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	m, err := s.meta.GetMention(r.Context(), project.ID, r.PathValue("id"))
+	if err != nil {
+		http.Error(w, `{"error":"mention not found"}`, http.StatusNotFound)
+		return
+	}
+
+	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
+	if err != nil || cfg.Provider == "" {
+		http.Error(w, `{"error":"LLM not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	proj, _ := s.meta.GetProject(r.Context(), project.ID)
+	desc := ""
+	if proj != nil {
+		desc = proj.Description
+	}
+
+	reply, err := ai.DraftMentionReply(r.Context(), cfg, ai.MentionDraftContext{
+		ProjectDescription: desc,
+		MentionTitle:       m.Title,
+		MentionContent:     m.Content,
+		MentionAuthor:      m.Author,
+		Platform:           m.SourceName,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"draft failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	_ = s.meta.UpdateMentionReply(r.Context(), project.ID, m.ID, reply)
+	_ = s.meta.UpdateMentionStatus(r.Context(), project.ID, m.ID, "reviewed")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"reply": reply})
+}
+
+func (s *Server) publishMentionReplyHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	m, err := s.meta.GetMention(r.Context(), project.ID, r.PathValue("id"))
+	if err != nil {
+		http.Error(w, `{"error":"mention not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var body struct {
+		PublisherName string `json:"publisher_name"`
+		ReplyText     string `json:"reply_text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	if body.PublisherName == "" {
+		body.PublisherName = m.SourceName
+	}
+	if body.ReplyText == "" {
+		body.ReplyText = m.SuggestedReply
+	}
+	if body.ReplyText == "" {
+		http.Error(w, `{"error":"no reply text"}`, http.StatusBadRequest)
+		return
+	}
+
+	pub := s.registry.GetPublisher(body.PublisherName)
+	if pub == nil {
+		http.Error(w, `{"error":"publisher not found"}`, http.StatusNotFound)
+		return
+	}
+
+	result, err := pub.Post(r.Context(), growth.PostContent{
+		Body:    body.ReplyText,
+		Channel: m.SourceName,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"publish failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	_ = s.meta.UpdateMentionStatus(r.Context(), project.ID, m.ID, "replied")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// --- Source monitor background job ---
+
+func (s *Server) startSourceMonitor() {
+	ticker := time.NewTicker(10 * time.Minute)
+	go func() {
+		for range ticker.C {
+			s.runSourceMonitor(context.Background())
+		}
+	}()
+}
+
+func (s *Server) runSourceMonitor(ctx context.Context) {
+	projects, err := s.meta.ListProjects(ctx)
+	if err != nil {
+		log.Printf("WARN source monitor: failed to list projects: %v", err)
+		return
+	}
+	for _, proj := range projects {
+		configs, err := s.meta.ListSourceConfigs(ctx, proj.ID)
+		if err != nil {
+			continue
+		}
+		for _, cfg := range configs {
+			if !cfg.Enabled {
+				continue
+			}
+			if cfg.LastRunAt != nil {
+				next := cfg.LastRunAt.Add(time.Duration(cfg.ScheduleMinutes) * time.Minute)
+				if time.Now().Before(next) {
+					continue
+				}
+			}
+
+			src := s.registry.GetSource(cfg.SourceName)
+			if src == nil {
+				continue
+			}
+
+			var keywords []string
+			_ = json.Unmarshal([]byte(cfg.Keywords), &keywords)
+
+			since := time.Now().Add(-24 * time.Hour)
+			if cfg.LastRunAt != nil {
+				since = *cfg.LastRunAt
+			}
+
+			mentions, err := src.Search(ctx, growth.SearchQuery{
+				Keywords:    keywords,
+				Since:       since,
+				MaxResults:  25,
+				ExtraFields: sourceCredentialFields(s.meta, ctx, proj.ID, cfg.SourceName),
+			})
+			if err != nil {
+				log.Printf("WARN source monitor: search failed for %s/%s: %v", proj.ID, cfg.SourceName, err)
+				continue
+			}
+
+			for _, m := range mentions {
+				id, _ := generateID()
+				_ = s.meta.UpsertMention(ctx, storage.MentionRecord{
+					ID:             id,
+					ProjectID:      proj.ID,
+					SourceName:     cfg.SourceName,
+					ExternalID:     m.ExternalID,
+					ExternalURL:    m.ExternalURL,
+					Author:         m.Author,
+					Title:          m.Title,
+					Content:        m.Content,
+					RelevanceScore: scoreRelevance(m.Content, m.Title, keywords),
+					ParentID:       m.ParentID,
+					Metadata:       "{}",
+					PostedAt:       &m.PostedAt,
+				})
+			}
+
+			_ = s.meta.UpdateSourceConfigLastRun(ctx, proj.ID, cfg.SourceName, time.Now().UTC())
+		}
+	}
+}
+
+// --- Query concurrency limiter ---
+
+// withQueryLimit wraps a handler to enforce the per-project concurrent DuckDB
+// query limit. Requests that exceed the limit get a 429 response immediately.
+func (s *Server) withQueryLimit(h http.Handler) http.Handler {
+	if s.config.MaxConcurrentQueries <= 0 {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		project := auth.ProjectFromContext(r.Context())
+		if project == nil {
+			h.ServeHTTP(w, r)
+			return
+		}
+		val, _ := s.querySlots.LoadOrStore(project.ID,
+			make(chan struct{}, s.config.MaxConcurrentQueries))
+		sem := val.(chan struct{})
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			http.Error(w, `{"error":"too many concurrent queries, try again shortly"}`, http.StatusTooManyRequests)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// --- Lead limit middleware ---
+
+// leadLimitCheck wraps a handler to enforce the per-project lead count limit.
+func (s *Server) leadLimitCheck(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.config.ResourceLimitFn != nil {
+			project := auth.ProjectFromContext(r.Context())
+			if project != nil {
+				if code, msg := s.config.ResourceLimitFn(r.Context(), project.ID, "leads"); code != 0 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(code)
+					json.NewEncoder(w).Encode(map[string]any{"error": msg, "upgrade_required": true})
+					return
+				}
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// --- Dead letter queue ---
+
+func (s *Server) deadLettersHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	deliveries, err := s.meta.ListDeadLetterDeliveries(r.Context(), project.ID, 50)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	// Attach webhook names for display.
+	webhooks, _ := s.meta.ListCRMWebhooks(r.Context(), project.ID)
+	nameMap := make(map[string]string, len(webhooks))
+	for _, wh := range webhooks {
+		nameMap[wh.ID] = wh.Name
+	}
+	type deadLetter struct {
+		storage.WebhookDelivery
+		WebhookName string `json:"webhook_name"`
+	}
+	result := make([]deadLetter, 0, len(deliveries))
+	for _, d := range deliveries {
+		result = append(result, deadLetter{
+			WebhookDelivery: d,
+			WebhookName:     nameMap[d.WebhookID],
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"dead_letters": result})
+}
+
+// --- Payload template ---
+
+// buildWebhookPayload builds the JSON body for a webhook push. If the webhook
+// has a payload_template, placeholders are substituted; otherwise the default
+// envelope is used.
+func buildWebhookPayload(wh storage.CRMWebhook, leads []storage.ScoredLead) []byte {
+	if wh.PayloadTemplate == "" {
+		b, _ := json.Marshal(map[string]any{
+			"project_id": wh.ProjectID,
+			"webhook":    wh.Name,
+			"leads":      leads,
+		})
+		return b
+	}
+	leadsJSON, _ := json.Marshal(leads)
+	ts := time.Now().UTC().Format(time.RFC3339)
+
+	tmpl, err := template.New("payload").Parse(wh.PayloadTemplate)
+	if err != nil {
+		// Fallback to default on bad template.
+		b, _ := json.Marshal(map[string]any{
+			"project_id": wh.ProjectID,
+			"webhook":    wh.Name,
+			"leads":      leads,
+		})
+		return b
+	}
+
+	data := map[string]any{
+		"leads":       string(leadsJSON),
+		"lead_count":  len(leads),
+		"project_id":  wh.ProjectID,
+		"webhook_name": wh.Name,
+		"timestamp":   ts,
+	}
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, data); err != nil {
+		b, _ := json.Marshal(map[string]any{
+			"project_id": wh.ProjectID,
+			"webhook":    wh.Name,
+			"leads":      leads,
+		})
+		return b
+	}
+	return []byte(buf.String())
+}
+
+// sourceCredentialFields looks up stored per-project OAuth credentials for a source/publisher
+// and returns them as an ExtraFields map for SearchQuery or PostContent.
+func sourceCredentialFields(meta *storage.SQLite, ctx context.Context, projectID, sourceName string) map[string]string {
+	creds, err := meta.GetSourceCredentials(ctx, projectID, sourceName)
+	if err != nil || creds == nil {
+		return nil
+	}
+	fields := map[string]string{}
+	if creds.AccessToken != "" {
+		fields["access_token"] = creds.AccessToken
+	}
+	if creds.RefreshToken != "" {
+		fields["refresh_token"] = creds.RefreshToken
+	}
+	return fields
+}
+
+func generateCodeVerifier() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func pkceChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+func (s *Server) getSourceCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+	creds, err := s.meta.GetSourceCredentials(r.Context(), project.ID, name)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil || creds == nil {
+		json.NewEncoder(w).Encode(map[string]any{"connected": false})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"connected":    true,
+		"username":     creds.Username,
+		"connected_at": creds.UpdatedAt,
+	})
+}
+
+func (s *Server) saveSourceCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+
+	var body struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if body.RefreshToken == "" && body.AccessToken == "" {
+		http.Error(w, `{"error":"access_token or refresh_token required"}`, http.StatusBadRequest)
+		return
+	}
+
+	username, err := s.validateSourceToken(r.Context(), name, body.AccessToken, body.RefreshToken)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"credential validation failed: %s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.meta.UpsertSourceCredentials(r.Context(), storage.SourceCredentials{
+		ProjectID:    project.ID,
+		SourceName:   name,
+		AccessToken:  body.AccessToken,
+		RefreshToken: body.RefreshToken,
+		Username:     username,
+	}); err != nil {
+		http.Error(w, `{"error":"failed to save credentials"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"connected": true, "username": username})
+}
+
+func (s *Server) deleteSourceCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+	_ = s.meta.DeleteSourceCredentials(r.Context(), project.ID, name)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (s *Server) sourceOAuthAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	name := r.PathValue("name")
+
+	stateBytes := make([]byte, 16)
+	rand.Read(stateBytes)
+	state := hex.EncodeToString(stateBytes)
+
+	scheme := "https"
+	if r.TLS == nil && !s.config.CloudMode {
+		scheme = "http"
+	}
+	redirectURI := fmt.Sprintf("%s://%s/api/v1/sources/%s/oauth/callback", scheme, r.Host, name)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch name {
+	case "reddit":
+		clientID := os.Getenv("REDDIT_CLIENT_ID")
+		if clientID == "" {
+			json.NewEncoder(w).Encode(map[string]any{"oauth_available": false})
+			return
+		}
+		if err := s.meta.SetOAuthStateExtra(r.Context(), state, project.ID, ""); err != nil {
+			http.Error(w, `{"error":"failed to create oauth state"}`, http.StatusInternalServerError)
+			return
+		}
+		params := url.Values{
+			"client_id":     {clientID},
+			"response_type": {"code"},
+			"state":         {state},
+			"redirect_uri":  {redirectURI},
+			"duration":      {"permanent"},
+			"scope":         {"identity read submit"},
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"oauth_available": true,
+			"url":             "https://www.reddit.com/api/v1/authorize?" + params.Encode(),
+		})
+
+	case "twitter":
+		clientID := os.Getenv("TWITTER_CLIENT_ID")
+		if clientID == "" {
+			json.NewEncoder(w).Encode(map[string]any{"oauth_available": false})
+			return
+		}
+		verifier := generateCodeVerifier()
+		challenge := pkceChallenge(verifier)
+		if err := s.meta.SetOAuthStateExtra(r.Context(), state, project.ID, verifier); err != nil {
+			http.Error(w, `{"error":"failed to create oauth state"}`, http.StatusInternalServerError)
+			return
+		}
+		params := url.Values{
+			"response_type":         {"code"},
+			"client_id":             {clientID},
+			"redirect_uri":          {redirectURI},
+			"scope":                 {"tweet.read tweet.write users.read offline.access"},
+			"state":                 {state},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"oauth_available": true,
+			"url":             "https://twitter.com/i/oauth2/authorize?" + params.Encode(),
+		})
+
+	default:
+		json.NewEncoder(w).Encode(map[string]any{"oauth_available": false})
+	}
+}
+
+func (s *Server) sourceOAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	errParam := r.URL.Query().Get("error")
+
+	if errParam != "" {
+		http.Redirect(w, r, "/growth/connectors?error=oauth_denied", http.StatusFound)
+		return
+	}
+	if code == "" || state == "" {
+		http.Redirect(w, r, "/growth/connectors?error=oauth_invalid", http.StatusFound)
+		return
+	}
+
+	projectID, extra, err := s.meta.ValidateOAuthStateExtra(r.Context(), state)
+	if err != nil {
+		http.Redirect(w, r, "/growth/connectors?error=oauth_state_invalid", http.StatusFound)
+		return
+	}
+
+	scheme := "https"
+	if r.TLS == nil && !s.config.CloudMode {
+		scheme = "http"
+	}
+	redirectURI := fmt.Sprintf("%s://%s/api/v1/sources/%s/oauth/callback", scheme, r.Host, name)
+
+	var accessToken, refreshToken, username string
+
+	switch name {
+	case "reddit":
+		clientID := os.Getenv("REDDIT_CLIENT_ID")
+		clientSecret := os.Getenv("REDDIT_CLIENT_SECRET")
+		accessToken, refreshToken, err = exchangeRedditCode(r.Context(), clientID, clientSecret, code, redirectURI)
+		if err != nil {
+			log.Printf("reddit oauth exchange error: %v", err)
+			http.Redirect(w, r, "/growth/connectors?error=oauth_exchange_failed", http.StatusFound)
+			return
+		}
+		username, _ = fetchRedditUsername(r.Context(), accessToken)
+
+	case "twitter":
+		clientID := os.Getenv("TWITTER_CLIENT_ID")
+		clientSecret := os.Getenv("TWITTER_CLIENT_SECRET")
+		accessToken, refreshToken, err = exchangeTwitterCode(r.Context(), clientID, clientSecret, code, redirectURI, extra)
+		if err != nil {
+			log.Printf("twitter oauth exchange error: %v", err)
+			http.Redirect(w, r, "/growth/connectors?error=oauth_exchange_failed", http.StatusFound)
+			return
+		}
+		username, _ = fetchTwitterUsername(r.Context(), accessToken)
+
+	default:
+		http.Redirect(w, r, "/growth/connectors?error=unknown_source", http.StatusFound)
+		return
+	}
+
+	if err := s.meta.UpsertSourceCredentials(r.Context(), storage.SourceCredentials{
+		ProjectID:    projectID,
+		SourceName:   name,
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		Username:     username,
+	}); err != nil {
+		log.Printf("save source credentials error: %v", err)
+		http.Redirect(w, r, "/growth/connectors?error=save_failed", http.StatusFound)
+		return
+	}
+
+	http.Redirect(w, r, "/growth/connectors?connected="+url.QueryEscape(name), http.StatusFound)
+}
+
+func exchangeRedditCode(ctx context.Context, clientID, clientSecret, code, redirectURI string) (accessToken, refreshToken string, err error) {
+	form := url.Values{
+		"grant_type":   {"authorization_code"},
+		"code":         {code},
+		"redirect_uri": {redirectURI},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://www.reddit.com/api/v1/access_token",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return "", "", err
+	}
+	req.SetBasicAuth(clientID, clientSecret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "ClickNest/1.0")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		Error        string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("decode reddit token response: %w", err)
+	}
+	if result.Error != "" {
+		return "", "", fmt.Errorf("reddit token error: %s", result.Error)
+	}
+	return result.AccessToken, result.RefreshToken, nil
+}
+
+func fetchRedditUsername(ctx context.Context, accessToken string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://oauth.reddit.com/api/v1/me", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "ClickNest/1.0")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var me struct{ Name string `json:"name"` }
+	json.NewDecoder(resp.Body).Decode(&me)
+	return me.Name, nil
+}
+
+func exchangeTwitterCode(ctx context.Context, clientID, clientSecret, code, redirectURI, codeVerifier string) (accessToken, refreshToken string, err error) {
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {codeVerifier},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.twitter.com/2/oauth2/token",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return "", "", err
+	}
+	req.SetBasicAuth(clientID, clientSecret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("decode twitter token response: %w", err)
+	}
+	if result.Error != "" {
+		return "", "", fmt.Errorf("twitter token error: %s: %s", result.Error, result.ErrorDesc)
+	}
+	return result.AccessToken, result.RefreshToken, nil
+}
+
+func fetchTwitterUsername(ctx context.Context, accessToken string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.twitter.com/2/users/me", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var me struct {
+		Data struct {
+			Username string `json:"username"`
+		} `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&me)
+	return me.Data.Username, nil
+}
+
+// validateSourceToken calls the platform API to verify credentials and return the username.
+func (s *Server) validateSourceToken(ctx context.Context, sourceName, accessToken, refreshToken string) (string, error) {
+	switch sourceName {
+	case "reddit":
+		clientID := os.Getenv("REDDIT_CLIENT_ID")
+		clientSecret := os.Getenv("REDDIT_CLIENT_SECRET")
+		// If no access token, try to exchange the refresh token for one.
+		if accessToken == "" && refreshToken != "" && clientID != "" {
+			form := url.Values{
+				"grant_type":    {"refresh_token"},
+				"refresh_token": {refreshToken},
+			}
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+				"https://www.reddit.com/api/v1/access_token",
+				strings.NewReader(form.Encode()),
+			)
+			req.SetBasicAuth(clientID, clientSecret)
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("User-Agent", "ClickNest/1.0")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return "", err
+			}
+			defer resp.Body.Close()
+			var tok struct {
+				AccessToken string `json:"access_token"`
+				Error       string `json:"error"`
+			}
+			json.NewDecoder(resp.Body).Decode(&tok)
+			if tok.Error != "" {
+				return "", fmt.Errorf("reddit token error: %s", tok.Error)
+			}
+			accessToken = tok.AccessToken
+		}
+		if accessToken == "" {
+			return "", fmt.Errorf("no valid access token available")
+		}
+		return fetchRedditUsername(ctx, accessToken)
+
+	case "twitter":
+		if accessToken == "" {
+			return "", fmt.Errorf("access_token required for Twitter")
+		}
+		return fetchTwitterUsername(ctx, accessToken)
+
+	default:
+		return "", fmt.Errorf("unsupported source: %s", sourceName)
+	}
+}
+
+// ---- Lead score history + attribution handlers --------------------------------
+
+func (s *Server) leadScoreHistoryHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	distinctID := r.PathValue("id")
+	history, err := s.meta.GetLeadScoreHistory(r.Context(), project.ID, distinctID, 30)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"history": history})
+}
+
+func (s *Server) leadAttributionHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	distinctID := r.PathValue("id")
+	sources, err := s.events.QueryLeadAttribution(r.Context(), project.ID, distinctID, 90)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"sources": sources})
+}
+
+// ---- Segment handlers --------------------------------------------------------
+
+func (s *Server) listSegmentsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	segs, err := s.meta.ListSegments(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"segments": segs})
+}
+
+func (s *Server) createSegmentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Name       string `json:"name"`
+		Conditions string `json:"conditions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+		http.Error(w, `{"error":"name is required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Conditions == "" {
+		body.Conditions = "[]"
+	}
+	seg, err := s.meta.CreateSegment(r.Context(), project.ID, body.Name, body.Conditions)
+	if err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(seg)
+}
+
+func (s *Server) deleteSegmentHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.meta.DeleteSegment(r.Context(), project.ID, id); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) segmentMembersHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	seg, err := s.meta.GetSegment(r.Context(), project.ID, id)
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Parse segment conditions as scoring rules and run a lead score query.
+	var conditions []storage.ScoringRule
+	if err := json.Unmarshal([]byte(seg.Conditions), &conditions); err != nil {
+		http.Error(w, `{"error":"invalid conditions"}`, http.StatusBadRequest)
+		return
+	}
+
+	start := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	end := time.Now().UTC()
+	leads, total, err := s.events.QueryLeadScores(r.Context(), project.ID, conditions, start, end, 200, 0)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	// Filter to only include users with score > 0 (actually matching at least one condition).
+	var members []storage.ScoredLead
+	for _, l := range leads {
+		if l.Score > 0 {
+			members = append(members, l)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"members": members, "total": total})
+}
+
+// ---- ICP settings handlers ---------------------------------------------------
+
+func (s *Server) getICPSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	autoRefresh, _ := s.meta.GetGrowthSetting(r.Context(), project.ID, "icp_auto_refresh")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"icp_auto_refresh": autoRefresh == "true",
+	})
+}
+
+func (s *Server) putICPSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		ICPAutoRefresh bool `json:"icp_auto_refresh"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	val := "false"
+	if body.ICPAutoRefresh {
+		val = "true"
+	}
+	if err := s.meta.SetGrowthSetting(r.Context(), project.ID, "icp_auto_refresh", val); err != nil {
+		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- Lead score snapshot background job -------------------------------------
+
+func (s *Server) startLeadScoreSnapshotter() {
+	go func() {
+		// Delay initial run to let the server warm up, then run at midnight-ish.
+		now := time.Now().UTC()
+		nextRun := time.Date(now.Year(), now.Month(), now.Day()+1, 3, 0, 0, 0, time.UTC)
+		time.Sleep(time.Until(nextRun))
+		s.runLeadScoreSnapshot(context.Background())
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.runLeadScoreSnapshot(context.Background())
+		}
+	}()
+}
+
+func (s *Server) runLeadScoreSnapshot(ctx context.Context) {
+	projects, err := s.meta.ListProjects(ctx)
+	if err != nil {
+		log.Printf("WARN score snapshot: list projects: %v", err)
+		return
+	}
+	today := time.Now().UTC().Format("2006-01-02")
+	start := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	end := time.Now().UTC()
+
+	for _, proj := range projects {
+		rules, err := s.meta.ListScoringRules(ctx, proj.ID)
+		if err != nil || len(rules) == 0 {
+			continue // skip projects without scoring rules
+		}
+		leads, _, err := s.events.QueryLeadScores(ctx, proj.ID, rules, start, end, 1000, 0)
+		if err != nil {
+			log.Printf("WARN score snapshot: query project %s: %v", proj.ID, err)
+			continue
+		}
+		for _, lead := range leads {
+			if lead.Score <= 0 {
+				continue
+			}
+			if err := s.meta.UpsertLeadScoreSnapshot(ctx, proj.ID, lead.DistinctID, today, lead.Score, lead.RawScore); err != nil {
+				log.Printf("WARN score snapshot: upsert %s/%s: %v", proj.ID, lead.DistinctID, err)
+			}
+		}
+		log.Printf("Score snapshot: saved %d leads for project %s", len(leads), proj.ID)
+	}
+}
+
+// ---- ICP auto-refresh background job ----------------------------------------
+
+func (s *Server) startICPAutoRefresh() {
+	go func() {
+		time.Sleep(5 * time.Minute) // wait for server to be ready
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.runICPAutoRefresh(context.Background())
+		}
+	}()
+}
+
+func (s *Server) runICPAutoRefresh(ctx context.Context) {
+	projectIDs, err := s.meta.ListProjectsWithSetting(ctx, "icp_auto_refresh", "true")
+	if err != nil || len(projectIDs) == 0 {
+		return
+	}
+
+	const weeklyInterval = 7 * 24 * time.Hour
+
+	for _, projectID := range projectIDs {
+		analyses, err := s.meta.ListICPAnalyses(ctx, projectID, 1)
+		if err != nil || len(analyses) == 0 {
+			continue
+		}
+		last := analyses[0]
+		if time.Since(last.CreatedAt) < weeklyInterval {
+			continue // not due yet
+		}
+
+		// Re-run with the same conversion pages.
+		var convPaths []string
+		if err := json.Unmarshal([]byte(last.ConversionPages), &convPaths); err != nil || len(convPaths) == 0 {
+			continue
+		}
+
+		cfg, err := s.meta.GetLLMConfig(ctx, projectID)
+		if err != nil || cfg == nil || cfg.Provider == "" {
+			continue // no LLM configured
+		}
+
+		now := time.Now().UTC()
+		profiles, err := s.events.QueryICPProfiles(ctx, projectID, convPaths, now.Add(-30*24*time.Hour), now, 50)
+		if err != nil || len(profiles) == 0 {
+			continue
+		}
+
+		aiProfiles := make([]ai.ICPProfile, len(profiles))
+		for i, p := range profiles {
+			aiProfiles[i] = ai.ICPProfile{
+				DistinctID:   p.DistinctID,
+				SessionCount: p.SessionCount,
+				EventCount:   p.EventCount,
+				TopPages:     p.TopPages,
+				EntrySource:  p.EntrySource,
+			}
+		}
+
+		proj, _ := s.meta.GetProject(ctx, projectID)
+		desc := ""
+		if proj != nil {
+			desc = proj.Description
+		}
+
+		analysis, err := ai.AnalyzeICP(ctx, cfg, aiProfiles, desc)
+		if err != nil {
+			log.Printf("WARN ICP auto-refresh project %s: %v", projectID, err)
+			continue
+		}
+
+		analysisID, _ := generateID()
+		pagesJSON, _ := json.Marshal(convPaths)
+		traitsJSON, _ := json.Marshal(analysis.CommonTraits)
+		channelsJSON, _ := json.Marshal(analysis.BestChannels)
+		recsJSON, _ := json.Marshal(analysis.Recommendations)
+		if err := s.meta.CreateICPAnalysis(ctx, storage.ICPAnalysis{
+			ID:              analysisID,
+			ProjectID:       projectID,
+			ConversionPages: string(pagesJSON),
+			Summary:         analysis.Summary,
+			Traits:          string(traitsJSON),
+			Channels:        string(channelsJSON),
+			Recommendations: string(recsJSON),
+			ProfileCount:    len(profiles),
+		}); err != nil {
+			log.Printf("WARN ICP auto-refresh save project %s: %v", projectID, err)
+		} else {
+			log.Printf("ICP auto-refresh: saved new analysis for project %s", projectID)
+		}
+	}
 }
 
 const devHTML = `<!DOCTYPE html>

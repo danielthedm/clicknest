@@ -308,6 +308,15 @@ func (s *SQLite) SetOAuthState(ctx context.Context, state, projectID string) err
 	return err
 }
 
+// SetOAuthStateExtra stores a CSRF state token plus source-specific extra data (e.g. PKCE verifier).
+func (s *SQLite) SetOAuthStateExtra(ctx context.Context, state, projectID, extra string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO oauth_state (state, project_id, extra) VALUES (?, ?, ?)`,
+		state, projectID, extra,
+	)
+	return err
+}
+
 // ValidateOAuthState checks that a state token exists and was created less than 10 minutes ago.
 // On success it deletes the token (one-time use) and returns the associated project ID.
 func (s *SQLite) ValidateOAuthState(ctx context.Context, state string) (string, error) {
@@ -325,6 +334,108 @@ func (s *SQLite) ValidateOAuthState(ctx context.Context, state string) (string, 
 	s.db.ExecContext(ctx, `DELETE FROM oauth_state WHERE state = ?`, state)
 
 	return projectID, nil
+}
+
+// ValidateOAuthStateExtra is like ValidateOAuthState but also returns the extra data blob.
+func (s *SQLite) ValidateOAuthStateExtra(ctx context.Context, state string) (projectID, extra string, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT project_id, extra FROM oauth_state
+		 WHERE state = ? AND created_at > datetime('now', '-10 minutes')`,
+		state,
+	).Scan(&projectID, &extra)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid or expired oauth state")
+	}
+	s.db.ExecContext(ctx, `DELETE FROM oauth_state WHERE state = ?`, state)
+	return projectID, extra, nil
+}
+
+// --- Source Credentials ---
+
+// SourceCredentials holds per-project OAuth credentials for a social platform.
+type SourceCredentials struct {
+	ID           string     `json:"id"`
+	ProjectID    string     `json:"project_id"`
+	SourceName   string     `json:"source_name"`
+	AccessToken  string     `json:"-"` // never serialised
+	RefreshToken string     `json:"-"` // never serialised
+	TokenExpiry  *time.Time `json:"token_expiry,omitempty"`
+	Username     string     `json:"username"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+// GetSourceCredentials returns the stored credentials for a source, or an error if not found.
+func (s *SQLite) GetSourceCredentials(ctx context.Context, projectID, sourceName string) (*SourceCredentials, error) {
+	var c SourceCredentials
+	var encAccess, encRefresh string
+	var tokenExpiry *time.Time
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, source_name, access_token, refresh_token, token_expiry,
+		        username, created_at, updated_at
+		 FROM source_credentials WHERE project_id = ? AND source_name = ?`,
+		projectID, sourceName,
+	).Scan(&c.ID, &c.ProjectID, &c.SourceName, &encAccess, &encRefresh, &tokenExpiry,
+		&c.Username, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	c.TokenExpiry = tokenExpiry
+
+	if encAccess != "" {
+		if dec, err := s.enc.Decrypt(encAccess); err == nil {
+			c.AccessToken = dec
+		}
+	}
+	if encRefresh != "" {
+		if dec, err := s.enc.Decrypt(encRefresh); err == nil {
+			c.RefreshToken = dec
+		}
+	}
+	return &c, nil
+}
+
+// UpsertSourceCredentials saves (or updates) per-project credentials for a source.
+func (s *SQLite) UpsertSourceCredentials(ctx context.Context, c SourceCredentials) error {
+	if c.ID == "" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return err
+		}
+		c.ID = hex.EncodeToString(b)
+	}
+
+	encAccess, err := s.enc.Encrypt(c.AccessToken)
+	if err != nil {
+		return fmt.Errorf("encrypting access token: %w", err)
+	}
+	encRefresh, err := s.enc.Encrypt(c.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("encrypting refresh token: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO source_credentials (id, project_id, source_name, access_token, refresh_token,
+		    token_expiry, username, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+		 ON CONFLICT (project_id, source_name) DO UPDATE SET
+		     access_token  = excluded.access_token,
+		     refresh_token = excluded.refresh_token,
+		     token_expiry  = excluded.token_expiry,
+		     username      = excluded.username,
+		     updated_at    = datetime('now')`,
+		c.ID, c.ProjectID, c.SourceName, encAccess, encRefresh, c.TokenExpiry, c.Username,
+	)
+	return err
+}
+
+// DeleteSourceCredentials removes stored credentials for a source.
+func (s *SQLite) DeleteSourceCredentials(ctx context.Context, projectID, sourceName string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM source_credentials WHERE project_id = ? AND source_name = ?`,
+		projectID, sourceName,
+	)
+	return err
 }
 
 func (s *SQLite) DB() *sql.DB {
@@ -646,6 +757,17 @@ func (s *SQLite) CreateRefCode(ctx context.Context, rc RefCode) error {
 	return err
 }
 
+func (s *SQLite) GetRefCode(ctx context.Context, projectID, id string) (*RefCode, error) {
+	var rc RefCode
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, code, name, notes, created_at, updated_at FROM ref_codes WHERE project_id = ? AND id = ?`, projectID, id,
+	).Scan(&rc.ID, &rc.ProjectID, &rc.Code, &rc.Name, &rc.Notes, &rc.CreatedAt, &rc.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &rc, nil
+}
+
 func (s *SQLite) ListRefCodes(ctx context.Context, projectID string) ([]RefCode, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, project_id, code, name, notes, created_at, updated_at
@@ -748,28 +870,30 @@ func (s *SQLite) DeleteScoringRule(ctx context.Context, projectID, id string) er
 // --- CRM Webhooks ---
 
 type CRMWebhook struct {
-	ID           string     `json:"id"`
-	ProjectID    string     `json:"project_id"`
-	Name         string     `json:"name"`
-	WebhookURL   string     `json:"webhook_url"`
-	MinScore     int        `json:"min_score"`
-	Enabled      bool       `json:"enabled"`
-	LastPushedAt *time.Time `json:"last_pushed_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID              string     `json:"id"`
+	ProjectID       string     `json:"project_id"`
+	Name            string     `json:"name"`
+	WebhookURL      string     `json:"webhook_url"`
+	MinScore        int        `json:"min_score"`
+	Enabled         bool       `json:"enabled"`
+	Secret          string     `json:"secret"`
+	PayloadTemplate string     `json:"payload_template,omitempty"`
+	LastPushedAt    *time.Time `json:"last_pushed_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 func (s *SQLite) CreateCRMWebhook(ctx context.Context, w CRMWebhook) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO crm_webhooks (id, project_id, name, webhook_url, min_score, enabled) VALUES (?, ?, ?, ?, ?, ?)`,
-		w.ID, w.ProjectID, w.Name, w.WebhookURL, w.MinScore, b2i(w.Enabled),
+		`INSERT INTO crm_webhooks (id, project_id, name, webhook_url, min_score, enabled, secret, payload_template) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		w.ID, w.ProjectID, w.Name, w.WebhookURL, w.MinScore, b2i(w.Enabled), w.Secret, w.PayloadTemplate,
 	)
 	return err
 }
 
 func (s *SQLite) ListCRMWebhooks(ctx context.Context, projectID string) ([]CRMWebhook, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, project_id, name, webhook_url, min_score, enabled, last_pushed_at, created_at, updated_at
+		`SELECT id, project_id, name, webhook_url, min_score, enabled, secret, payload_template, last_pushed_at, created_at, updated_at
 		 FROM crm_webhooks WHERE project_id = ? ORDER BY created_at DESC`, projectID,
 	)
 	if err != nil {
@@ -781,7 +905,7 @@ func (s *SQLite) ListCRMWebhooks(ctx context.Context, projectID string) ([]CRMWe
 	for rows.Next() {
 		var wh CRMWebhook
 		var enabledInt int
-		if err := rows.Scan(&wh.ID, &wh.ProjectID, &wh.Name, &wh.WebhookURL, &wh.MinScore, &enabledInt, &wh.LastPushedAt, &wh.CreatedAt, &wh.UpdatedAt); err != nil {
+		if err := rows.Scan(&wh.ID, &wh.ProjectID, &wh.Name, &wh.WebhookURL, &wh.MinScore, &enabledInt, &wh.Secret, &wh.PayloadTemplate, &wh.LastPushedAt, &wh.CreatedAt, &wh.UpdatedAt); err != nil {
 			return nil, err
 		}
 		wh.Enabled = enabledInt != 0
@@ -792,7 +916,7 @@ func (s *SQLite) ListCRMWebhooks(ctx context.Context, projectID string) ([]CRMWe
 
 func (s *SQLite) ListAllEnabledCRMWebhooks(ctx context.Context) ([]CRMWebhook, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, project_id, name, webhook_url, min_score, enabled, last_pushed_at, created_at, updated_at
+		`SELECT id, project_id, name, webhook_url, min_score, enabled, secret, payload_template, last_pushed_at, created_at, updated_at
 		 FROM crm_webhooks WHERE enabled = 1 ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -804,7 +928,7 @@ func (s *SQLite) ListAllEnabledCRMWebhooks(ctx context.Context) ([]CRMWebhook, e
 	for rows.Next() {
 		var wh CRMWebhook
 		var enabledInt int
-		if err := rows.Scan(&wh.ID, &wh.ProjectID, &wh.Name, &wh.WebhookURL, &wh.MinScore, &enabledInt, &wh.LastPushedAt, &wh.CreatedAt, &wh.UpdatedAt); err != nil {
+		if err := rows.Scan(&wh.ID, &wh.ProjectID, &wh.Name, &wh.WebhookURL, &wh.MinScore, &enabledInt, &wh.Secret, &wh.PayloadTemplate, &wh.LastPushedAt, &wh.CreatedAt, &wh.UpdatedAt); err != nil {
 			return nil, err
 		}
 		wh.Enabled = enabledInt != 0
@@ -813,11 +937,11 @@ func (s *SQLite) ListAllEnabledCRMWebhooks(ctx context.Context) ([]CRMWebhook, e
 	return webhooks, rows.Err()
 }
 
-func (s *SQLite) UpdateCRMWebhook(ctx context.Context, projectID, id string, name, webhookURL string, minScore int, enabled bool) error {
+func (s *SQLite) UpdateCRMWebhook(ctx context.Context, projectID, id string, name, webhookURL string, minScore int, enabled bool, secret, payloadTemplate string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE crm_webhooks SET name = ?, webhook_url = ?, min_score = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+		`UPDATE crm_webhooks SET name = ?, webhook_url = ?, min_score = ?, enabled = ?, secret = ?, payload_template = ?, updated_at = CURRENT_TIMESTAMP
 		 WHERE project_id = ? AND id = ?`,
-		name, webhookURL, minScore, b2i(enabled), projectID, id,
+		name, webhookURL, minScore, b2i(enabled), secret, payloadTemplate, projectID, id,
 	)
 	return err
 }
@@ -847,22 +971,23 @@ type Campaign struct {
 	Status    string    `json:"status"`
 	Content   string    `json:"content"`
 	AIPrompt  string    `json:"ai_prompt"`
+	Cost      float64   `json:"cost"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (s *SQLite) CreateCampaign(ctx context.Context, c Campaign) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO campaigns (id, project_id, name, channel, ref_code_id, status, content, ai_prompt)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.ProjectID, c.Name, c.Channel, c.RefCodeID, c.Status, c.Content, c.AIPrompt,
+		`INSERT INTO campaigns (id, project_id, name, channel, ref_code_id, status, content, ai_prompt, cost)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ProjectID, c.Name, c.Channel, c.RefCodeID, c.Status, c.Content, c.AIPrompt, c.Cost,
 	)
 	return err
 }
 
 func (s *SQLite) ListCampaigns(ctx context.Context, projectID string) ([]Campaign, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, project_id, name, channel, COALESCE(ref_code_id, ''), status, content, ai_prompt, created_at, updated_at
+		`SELECT id, project_id, name, channel, COALESCE(ref_code_id, ''), status, content, ai_prompt, cost, created_at, updated_at
 		 FROM campaigns WHERE project_id = ? ORDER BY created_at DESC`, projectID,
 	)
 	if err != nil {
@@ -873,7 +998,7 @@ func (s *SQLite) ListCampaigns(ctx context.Context, projectID string) ([]Campaig
 	var campaigns []Campaign
 	for rows.Next() {
 		var c Campaign
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Channel, &c.RefCodeID, &c.Status, &c.Content, &c.AIPrompt, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Channel, &c.RefCodeID, &c.Status, &c.Content, &c.AIPrompt, &c.Cost, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		campaigns = append(campaigns, c)
@@ -884,20 +1009,20 @@ func (s *SQLite) ListCampaigns(ctx context.Context, projectID string) ([]Campaig
 func (s *SQLite) GetCampaign(ctx context.Context, projectID, id string) (*Campaign, error) {
 	var c Campaign
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, project_id, name, channel, COALESCE(ref_code_id, ''), status, content, ai_prompt, created_at, updated_at
+		`SELECT id, project_id, name, channel, COALESCE(ref_code_id, ''), status, content, ai_prompt, cost, created_at, updated_at
 		 FROM campaigns WHERE project_id = ? AND id = ?`, projectID, id,
-	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Channel, &c.RefCodeID, &c.Status, &c.Content, &c.AIPrompt, &c.CreatedAt, &c.UpdatedAt)
+	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Channel, &c.RefCodeID, &c.Status, &c.Content, &c.AIPrompt, &c.Cost, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func (s *SQLite) UpdateCampaign(ctx context.Context, projectID, id, name, status, content string) error {
+func (s *SQLite) UpdateCampaign(ctx context.Context, projectID, id, name, status, content string, cost float64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE campaigns SET name = ?, status = ?, content = ?, updated_at = CURRENT_TIMESTAMP
+		`UPDATE campaigns SET name = ?, status = ?, content = ?, cost = ?, updated_at = CURRENT_TIMESTAMP
 		 WHERE project_id = ? AND id = ?`,
-		name, status, content, projectID, id,
+		name, status, content, cost, projectID, id,
 	)
 	return err
 }
@@ -1154,4 +1279,693 @@ func generateAPIKey() (string, error) {
 		return "", fmt.Errorf("generating api key: %w", err)
 	}
 	return "cn_" + hex.EncodeToString(b), nil
+}
+
+// --- Webhook Deliveries ---
+
+type WebhookDelivery struct {
+	ID           string    `json:"id"`
+	WebhookID    string    `json:"webhook_id"`
+	ProjectID    string    `json:"project_id"`
+	LeadCount    int       `json:"lead_count"`
+	StatusCode   int       `json:"status_code"`
+	ResponseBody string    `json:"response_body"`
+	Error        string    `json:"error"`
+	Success      bool      `json:"success"`
+	Attempt      int       `json:"attempt"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+func (s *SQLite) CreateWebhookDelivery(ctx context.Context, d WebhookDelivery) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO webhook_deliveries (id, webhook_id, project_id, lead_count, status_code, response_body, error, success, attempt)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.WebhookID, d.ProjectID, d.LeadCount, d.StatusCode, d.ResponseBody, d.Error, b2i(d.Success), d.Attempt,
+	)
+	return err
+}
+
+func (s *SQLite) ListWebhookDeliveries(ctx context.Context, projectID, webhookID string, limit int) ([]WebhookDelivery, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, webhook_id, project_id, lead_count, status_code, response_body, error, success, attempt, created_at
+		 FROM webhook_deliveries WHERE project_id = ? AND webhook_id = ? ORDER BY created_at DESC LIMIT ?`,
+		projectID, webhookID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deliveries []WebhookDelivery
+	for rows.Next() {
+		var d WebhookDelivery
+		var successInt int
+		if err := rows.Scan(&d.ID, &d.WebhookID, &d.ProjectID, &d.LeadCount, &d.StatusCode, &d.ResponseBody, &d.Error, &successInt, &d.Attempt, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		d.Success = successInt != 0
+		deliveries = append(deliveries, d)
+	}
+	return deliveries, rows.Err()
+}
+
+// ListDeadLetterDeliveries returns failed deliveries for a project (across all webhooks)
+// where the delivery exhausted all retries (attempt >= 3) and was never successful.
+// It joins with crm_webhooks to include the webhook name.
+func (s *SQLite) ListDeadLetterDeliveries(ctx context.Context, projectID string, limit int) ([]WebhookDelivery, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT d.id, d.webhook_id, d.project_id, d.lead_count, d.status_code,
+		        d.response_body, d.error, d.success, d.attempt, d.created_at
+		 FROM webhook_deliveries d
+		 WHERE d.project_id = ? AND d.success = 0 AND d.attempt >= 3
+		   AND NOT EXISTS (
+		       SELECT 1 FROM webhook_deliveries s
+		       WHERE s.webhook_id = d.webhook_id AND s.success = 1
+		         AND s.created_at > d.created_at
+		   )
+		 ORDER BY d.created_at DESC LIMIT ?`,
+		projectID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deliveries []WebhookDelivery
+	for rows.Next() {
+		var d WebhookDelivery
+		var successInt int
+		if err := rows.Scan(&d.ID, &d.WebhookID, &d.ProjectID, &d.LeadCount, &d.StatusCode,
+			&d.ResponseBody, &d.Error, &successInt, &d.Attempt, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		d.Success = successInt != 0
+		deliveries = append(deliveries, d)
+	}
+	return deliveries, rows.Err()
+}
+
+// --- Mentions ---
+
+type MentionRecord struct {
+	ID             string     `json:"id"`
+	ProjectID      string     `json:"project_id"`
+	SourceName     string     `json:"source_name"`
+	ExternalID     string     `json:"external_id"`
+	ExternalURL    string     `json:"external_url"`
+	Author         string     `json:"author"`
+	Title          string     `json:"title"`
+	Content        string     `json:"content"`
+	RelevanceScore float64    `json:"relevance_score"`
+	Status         string     `json:"status"`
+	SuggestedReply string     `json:"suggested_reply"`
+	ParentID       string     `json:"parent_id"`
+	Metadata       string     `json:"metadata"`
+	PostedAt       *time.Time `json:"posted_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+func (s *SQLite) UpsertMention(ctx context.Context, m MentionRecord) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO mentions (id, project_id, source_name, external_id, external_url, author, title, content, relevance_score, status, parent_id, metadata, posted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+		 ON CONFLICT(project_id, source_name, external_id) DO NOTHING`,
+		m.ID, m.ProjectID, m.SourceName, m.ExternalID, m.ExternalURL,
+		m.Author, m.Title, m.Content, m.RelevanceScore,
+		m.ParentID, m.Metadata, m.PostedAt,
+	)
+	return err
+}
+
+func (s *SQLite) ListMentions(ctx context.Context, projectID, status, source string, limit, offset int) ([]MentionRecord, int, error) {
+	where := "WHERE project_id = ?"
+	args := []any{projectID}
+	if status != "" {
+		where += " AND status = ?"
+		args = append(args, status)
+	}
+	if source != "" {
+		where += " AND source_name = ?"
+		args = append(args, source)
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM mentions "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := fmt.Sprintf("SELECT id, project_id, source_name, external_id, external_url, author, title, content, relevance_score, status, suggested_reply, parent_id, metadata, posted_at, created_at, updated_at FROM mentions %s ORDER BY created_at DESC LIMIT ? OFFSET ?", where)
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var mentions []MentionRecord
+	for rows.Next() {
+		var m MentionRecord
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.SourceName, &m.ExternalID, &m.ExternalURL, &m.Author, &m.Title, &m.Content, &m.RelevanceScore, &m.Status, &m.SuggestedReply, &m.ParentID, &m.Metadata, &m.PostedAt, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		mentions = append(mentions, m)
+	}
+	return mentions, total, rows.Err()
+}
+
+func (s *SQLite) GetMention(ctx context.Context, projectID, id string) (*MentionRecord, error) {
+	var m MentionRecord
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, source_name, external_id, external_url, author, title, content, relevance_score, status, suggested_reply, parent_id, metadata, posted_at, created_at, updated_at
+		 FROM mentions WHERE project_id = ? AND id = ?`, projectID, id,
+	).Scan(&m.ID, &m.ProjectID, &m.SourceName, &m.ExternalID, &m.ExternalURL, &m.Author, &m.Title, &m.Content, &m.RelevanceScore, &m.Status, &m.SuggestedReply, &m.ParentID, &m.Metadata, &m.PostedAt, &m.CreatedAt, &m.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *SQLite) UpdateMentionStatus(ctx context.Context, projectID, id, status string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE mentions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND id = ?`,
+		status, projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) UpdateMentionReply(ctx context.Context, projectID, id, suggestedReply string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE mentions SET suggested_reply = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND id = ?`,
+		suggestedReply, projectID, id,
+	)
+	return err
+}
+
+// --- Source Configs ---
+
+type SourceConfig struct {
+	ID              string     `json:"id"`
+	ProjectID       string     `json:"project_id"`
+	SourceName      string     `json:"source_name"`
+	Keywords        string     `json:"keywords"`
+	Filters         string     `json:"filters"`
+	ScheduleMinutes int        `json:"schedule_minutes"`
+	Enabled         bool       `json:"enabled"`
+	LastRunAt       *time.Time `json:"last_run_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+func (s *SQLite) ListSourceConfigs(ctx context.Context, projectID string) ([]SourceConfig, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, source_name, keywords, filters, schedule_minutes, enabled, last_run_at, created_at, updated_at
+		 FROM source_configs WHERE project_id = ? ORDER BY source_name`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []SourceConfig
+	for rows.Next() {
+		var sc SourceConfig
+		if err := rows.Scan(&sc.ID, &sc.ProjectID, &sc.SourceName, &sc.Keywords, &sc.Filters, &sc.ScheduleMinutes, &sc.Enabled, &sc.LastRunAt, &sc.CreatedAt, &sc.UpdatedAt); err != nil {
+			return nil, err
+		}
+		configs = append(configs, sc)
+	}
+	return configs, rows.Err()
+}
+
+func (s *SQLite) GetSourceConfig(ctx context.Context, projectID, sourceName string) (*SourceConfig, error) {
+	var sc SourceConfig
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, source_name, keywords, filters, schedule_minutes, enabled, last_run_at, created_at, updated_at
+		 FROM source_configs WHERE project_id = ? AND source_name = ?`, projectID, sourceName,
+	).Scan(&sc.ID, &sc.ProjectID, &sc.SourceName, &sc.Keywords, &sc.Filters, &sc.ScheduleMinutes, &sc.Enabled, &sc.LastRunAt, &sc.CreatedAt, &sc.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &sc, nil
+}
+
+func (s *SQLite) UpsertSourceConfig(ctx context.Context, sc SourceConfig) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO source_configs (id, project_id, source_name, keywords, filters, schedule_minutes, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id, source_name) DO UPDATE SET
+		   keywords = excluded.keywords,
+		   filters = excluded.filters,
+		   schedule_minutes = excluded.schedule_minutes,
+		   enabled = excluded.enabled,
+		   updated_at = CURRENT_TIMESTAMP`,
+		sc.ID, sc.ProjectID, sc.SourceName, sc.Keywords, sc.Filters, sc.ScheduleMinutes, b2i(sc.Enabled),
+	)
+	return err
+}
+
+func (s *SQLite) UpdateSourceConfigLastRun(ctx context.Context, projectID, sourceName string, t time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE source_configs SET last_run_at = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND source_name = ?`,
+		t, projectID, sourceName,
+	)
+	return err
+}
+
+// --- ICP Analyses ---
+
+type ICPAnalysis struct {
+	ID              string    `json:"id"`
+	ProjectID       string    `json:"project_id"`
+	ConversionPages string    `json:"conversion_pages"`
+	Summary         string    `json:"summary"`
+	Traits          string    `json:"traits"`
+	Channels        string    `json:"channels"`
+	Recommendations string    `json:"recommendations"`
+	ProfileCount    int       `json:"profile_count"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+func (s *SQLite) CreateICPAnalysis(ctx context.Context, a ICPAnalysis) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO icp_analyses (id, project_id, conversion_pages, summary, traits, channels, recommendations, profile_count)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.ProjectID, a.ConversionPages, a.Summary, a.Traits, a.Channels, a.Recommendations, a.ProfileCount,
+	)
+	return err
+}
+
+func (s *SQLite) ListICPAnalyses(ctx context.Context, projectID string, limit int) ([]ICPAnalysis, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, conversion_pages, summary, traits, channels, recommendations, profile_count, created_at
+		 FROM icp_analyses WHERE project_id = ? ORDER BY created_at DESC LIMIT ?`, projectID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var analyses []ICPAnalysis
+	for rows.Next() {
+		var a ICPAnalysis
+		if err := rows.Scan(&a.ID, &a.ProjectID, &a.ConversionPages, &a.Summary, &a.Traits, &a.Channels, &a.Recommendations, &a.ProfileCount, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		analyses = append(analyses, a)
+	}
+	return analyses, rows.Err()
+}
+
+func (s *SQLite) GetICPAnalysis(ctx context.Context, projectID, id string) (*ICPAnalysis, error) {
+	var a ICPAnalysis
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, conversion_pages, summary, traits, channels, recommendations, profile_count, created_at
+		 FROM icp_analyses WHERE project_id = ? AND id = ?`, projectID, id,
+	).Scan(&a.ID, &a.ProjectID, &a.ConversionPages, &a.Summary, &a.Traits, &a.Channels, &a.Recommendations, &a.ProfileCount, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (s *SQLite) DeleteICPAnalysis(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM icp_analyses WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
+}
+
+// ---- Lead Score Snapshots --------------------------------------------------
+
+// LeadScoreSnapshot stores a daily snapshot of a lead's score for trend tracking.
+type LeadScoreSnapshot struct {
+	ID           string    `json:"id"`
+	ProjectID    string    `json:"project_id"`
+	DistinctID   string    `json:"distinct_id"`
+	Score        int       `json:"score"`
+	RawScore     int       `json:"raw_score"`
+	SnapshotDate string    `json:"snapshot_date"` // YYYY-MM-DD
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// UpsertLeadScoreSnapshot inserts or replaces a daily score snapshot.
+func (s *SQLite) UpsertLeadScoreSnapshot(ctx context.Context, projectID, distinctID, date string, score, rawScore int) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO lead_score_snapshots (id, project_id, distinct_id, score, raw_score, snapshot_date)
+		VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, distinct_id, snapshot_date) DO UPDATE SET
+			score = excluded.score,
+			raw_score = excluded.raw_score`,
+		projectID, distinctID, score, rawScore, date,
+	)
+	return err
+}
+
+// GetYesterdayScores returns a map of distinct_id → score from yesterday's snapshot.
+// Used to compute score deltas in the leads list.
+func (s *SQLite) GetYesterdayScores(ctx context.Context, projectID string) (map[string]int, error) {
+	yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT distinct_id, score FROM lead_score_snapshots WHERE project_id = ? AND snapshot_date = ?`,
+		projectID, yesterday,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var id string
+		var score int
+		if err := rows.Scan(&id, &score); err != nil {
+			return nil, err
+		}
+		out[id] = score
+	}
+	return out, rows.Err()
+}
+
+// GetLeadScoreHistory returns daily score snapshots for a lead over the last N days.
+func (s *SQLite) GetLeadScoreHistory(ctx context.Context, projectID, distinctID string, days int) ([]LeadScoreSnapshot, error) {
+	if days <= 0 {
+		days = 30
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, project_id, distinct_id, score, raw_score, snapshot_date, created_at
+		FROM lead_score_snapshots
+		WHERE project_id = ? AND distinct_id = ?
+		ORDER BY snapshot_date DESC LIMIT ?`,
+		projectID, distinctID, days,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LeadScoreSnapshot
+	for rows.Next() {
+		var sn LeadScoreSnapshot
+		if err := rows.Scan(&sn.ID, &sn.ProjectID, &sn.DistinctID, &sn.Score, &sn.RawScore, &sn.SnapshotDate, &sn.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sn)
+	}
+	return out, rows.Err()
+}
+
+// ---- Growth Settings -------------------------------------------------------
+
+// GetGrowthSetting retrieves a project-scoped setting value by key.
+// Returns "" if the key is not set.
+func (s *SQLite) GetGrowthSetting(ctx context.Context, projectID, key string) (string, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM growth_settings WHERE project_id = ? AND key = ?`, projectID, key,
+	).Scan(&value)
+	if err != nil {
+		return "", nil // not found → treat as empty
+	}
+	return value, nil
+}
+
+// SetGrowthSetting upserts a project-scoped setting.
+func (s *SQLite) SetGrowthSetting(ctx context.Context, projectID, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO growth_settings (project_id, key, value, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(project_id, key) DO UPDATE SET
+			value = excluded.value,
+			updated_at = CURRENT_TIMESTAMP`,
+		projectID, key, value,
+	)
+	return err
+}
+
+// ListProjectsWithSetting returns project IDs where a specific setting equals a given value.
+func (s *SQLite) ListProjectsWithSetting(ctx context.Context, key, value string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT project_id FROM growth_settings WHERE key = ? AND value = ?`, key, value,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ---- Segments ---------------------------------------------------------------
+
+// Segment is a named, saved user filter defined by scoring-rule-style conditions.
+type Segment struct {
+	ID         string    `json:"id"`
+	ProjectID  string    `json:"project_id"`
+	Name       string    `json:"name"`
+	Conditions string    `json:"conditions"` // JSON array of rule-like objects
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// CreateSegment inserts a new segment and returns it with its generated ID.
+func (s *SQLite) CreateSegment(ctx context.Context, projectID, name, conditions string) (*Segment, error) {
+	seg := &Segment{}
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO segments (id, project_id, name, conditions)
+		VALUES (lower(hex(randomblob(16))), ?, ?, ?)
+		RETURNING id, project_id, name, conditions, created_at, updated_at`,
+		projectID, name, conditions,
+	).Scan(&seg.ID, &seg.ProjectID, &seg.Name, &seg.Conditions, &seg.CreatedAt, &seg.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return seg, nil
+}
+
+// ListSegments returns all segments for a project, ordered by creation time descending.
+func (s *SQLite) ListSegments(ctx context.Context, projectID string) ([]Segment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, project_id, name, conditions, created_at, updated_at
+		FROM segments WHERE project_id = ? ORDER BY created_at DESC`,
+		projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Segment
+	for rows.Next() {
+		var seg Segment
+		if err := rows.Scan(&seg.ID, &seg.ProjectID, &seg.Name, &seg.Conditions, &seg.CreatedAt, &seg.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, seg)
+	}
+	return out, rows.Err()
+}
+
+// GetSegment retrieves a single segment by ID.
+func (s *SQLite) GetSegment(ctx context.Context, projectID, id string) (*Segment, error) {
+	seg := &Segment{}
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, project_id, name, conditions, created_at, updated_at
+		FROM segments WHERE project_id = ? AND id = ?`,
+		projectID, id,
+	).Scan(&seg.ID, &seg.ProjectID, &seg.Name, &seg.Conditions, &seg.CreatedAt, &seg.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return seg, nil
+}
+
+// DeleteSegment removes a segment by ID.
+func (s *SQLite) DeleteSegment(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM segments WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
+}
+
+// --- Conversion Goals ---
+
+type ConversionGoal struct {
+	ID            string    `json:"id"`
+	ProjectID     string    `json:"project_id"`
+	Name          string    `json:"name"`
+	EventType     string    `json:"event_type"`
+	EventName     string    `json:"event_name"`
+	URLPattern    string    `json:"url_pattern"`
+	ValueProperty string    `json:"value_property"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func (s *SQLite) CreateConversionGoal(ctx context.Context, g ConversionGoal) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversion_goals (id, project_id, name, event_type, event_name, url_pattern, value_property)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		g.ID, g.ProjectID, g.Name, g.EventType, g.EventName, g.URLPattern, g.ValueProperty,
+	)
+	return err
+}
+
+func (s *SQLite) ListConversionGoals(ctx context.Context, projectID string) ([]ConversionGoal, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, name, event_type, event_name, url_pattern, value_property, created_at, updated_at
+		 FROM conversion_goals WHERE project_id = ? ORDER BY created_at DESC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var goals []ConversionGoal
+	for rows.Next() {
+		var g ConversionGoal
+		if err := rows.Scan(&g.ID, &g.ProjectID, &g.Name, &g.EventType, &g.EventName, &g.URLPattern, &g.ValueProperty, &g.CreatedAt, &g.UpdatedAt); err != nil {
+			return nil, err
+		}
+		goals = append(goals, g)
+	}
+	return goals, rows.Err()
+}
+
+func (s *SQLite) GetConversionGoal(ctx context.Context, projectID, id string) (*ConversionGoal, error) {
+	var g ConversionGoal
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, name, event_type, event_name, url_pattern, value_property, created_at, updated_at
+		 FROM conversion_goals WHERE project_id = ? AND id = ?`, projectID, id,
+	).Scan(&g.ID, &g.ProjectID, &g.Name, &g.EventType, &g.EventName, &g.URLPattern, &g.ValueProperty, &g.CreatedAt, &g.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
+
+func (s *SQLite) UpdateConversionGoal(ctx context.Context, projectID, id string, g ConversionGoal) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE conversion_goals SET name = ?, event_type = ?, event_name = ?, url_pattern = ?, value_property = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE project_id = ? AND id = ?`,
+		g.Name, g.EventType, g.EventName, g.URLPattern, g.ValueProperty, projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) DeleteConversionGoal(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM conversion_goals WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
+}
+
+// --- Experiments ---
+
+type Experiment struct {
+	ID               string     `json:"id"`
+	ProjectID        string     `json:"project_id"`
+	Name             string     `json:"name"`
+	FlagKey          string     `json:"flag_key"`
+	Variants         string     `json:"variants"`
+	ConversionGoalID string     `json:"conversion_goal_id,omitempty"`
+	Status           string     `json:"status"`
+	AutoStop         bool       `json:"auto_stop"`
+	StartedAt        time.Time  `json:"started_at"`
+	EndedAt          *time.Time `json:"ended_at,omitempty"`
+	WinnerVariant    string     `json:"winner_variant,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+func (s *SQLite) CreateExperiment(ctx context.Context, e Experiment) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO experiments (id, project_id, name, flag_key, variants, conversion_goal_id, status, auto_stop)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.ProjectID, e.Name, e.FlagKey, e.Variants, e.ConversionGoalID, e.Status, b2i(e.AutoStop),
+	)
+	return err
+}
+
+func (s *SQLite) ListExperiments(ctx context.Context, projectID string) ([]Experiment, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, project_id, name, flag_key, variants, COALESCE(conversion_goal_id, ''), status, auto_stop, started_at, ended_at, winner_variant, created_at, updated_at
+		 FROM experiments WHERE project_id = ? ORDER BY created_at DESC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var experiments []Experiment
+	for rows.Next() {
+		var e Experiment
+		var autoStopInt int
+		if err := rows.Scan(&e.ID, &e.ProjectID, &e.Name, &e.FlagKey, &e.Variants, &e.ConversionGoalID, &e.Status, &autoStopInt, &e.StartedAt, &e.EndedAt, &e.WinnerVariant, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		e.AutoStop = autoStopInt != 0
+		experiments = append(experiments, e)
+	}
+	return experiments, rows.Err()
+}
+
+func (s *SQLite) GetExperiment(ctx context.Context, projectID, id string) (*Experiment, error) {
+	var e Experiment
+	var autoStopInt int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, name, flag_key, variants, COALESCE(conversion_goal_id, ''), status, auto_stop, started_at, ended_at, winner_variant, created_at, updated_at
+		 FROM experiments WHERE project_id = ? AND id = ?`, projectID, id,
+	).Scan(&e.ID, &e.ProjectID, &e.Name, &e.FlagKey, &e.Variants, &e.ConversionGoalID, &e.Status, &autoStopInt, &e.StartedAt, &e.EndedAt, &e.WinnerVariant, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	e.AutoStop = autoStopInt != 0
+	return &e, nil
+}
+
+func (s *SQLite) GetExperimentByFlagKey(ctx context.Context, projectID, flagKey string) (*Experiment, error) {
+	var e Experiment
+	var autoStopInt int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, project_id, name, flag_key, variants, COALESCE(conversion_goal_id, ''), status, auto_stop, started_at, ended_at, winner_variant, created_at, updated_at
+		 FROM experiments WHERE project_id = ? AND flag_key = ? AND status = 'running' LIMIT 1`, projectID, flagKey,
+	).Scan(&e.ID, &e.ProjectID, &e.Name, &e.FlagKey, &e.Variants, &e.ConversionGoalID, &e.Status, &autoStopInt, &e.StartedAt, &e.EndedAt, &e.WinnerVariant, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	e.AutoStop = autoStopInt != 0
+	return &e, nil
+}
+
+func (s *SQLite) UpdateExperiment(ctx context.Context, projectID, id string, name, status string, autoStop bool, conversionGoalID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE experiments SET name = ?, status = ?, auto_stop = ?, conversion_goal_id = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE project_id = ? AND id = ?`,
+		name, status, b2i(autoStop), conversionGoalID, projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) EndExperiment(ctx context.Context, projectID, id, winnerVariant string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE experiments SET status = 'completed', ended_at = CURRENT_TIMESTAMP, winner_variant = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE project_id = ? AND id = ?`,
+		winnerVariant, projectID, id,
+	)
+	return err
+}
+
+func (s *SQLite) DeleteExperiment(ctx context.Context, projectID, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM experiments WHERE project_id = ? AND id = ?`, projectID, id,
+	)
+	return err
 }

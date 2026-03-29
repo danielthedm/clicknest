@@ -1181,6 +1181,23 @@ func (d *DuckDB) BackfillEventName(ctx context.Context, projectID, fingerprint, 
 	return err
 }
 
+// DeleteOldEvents removes events older than the given cutoff for a project.
+func (d *DuckDB) DeleteOldEvents(ctx context.Context, projectID string, before time.Time) (int64, error) {
+	result, err := d.db.ExecContext(ctx,
+		`DELETE FROM events WHERE project_id = ? AND timestamp < ?`,
+		projectID, before,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// QueryTimeout creates a context with a 30-second timeout for dashboard queries.
+func (d *DuckDB) QueryTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
 // Checkpoint flushes the DuckDB WAL to the main database file, making it safe to copy.
 func (d *DuckDB) Checkpoint(ctx context.Context) error {
 	_, err := d.db.ExecContext(ctx, "CHECKPOINT")

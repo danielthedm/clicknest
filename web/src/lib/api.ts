@@ -418,12 +418,16 @@ export async function listCRMWebhooks(): Promise<{ webhooks: CRMWebhook[] }> {
 	return request('/crm-webhooks');
 }
 
-export async function createCRMWebhook(data: { name: string; webhook_url: string; min_score: number }): Promise<CRMWebhook> {
+export async function createCRMWebhook(data: { name: string; webhook_url: string; min_score: number; payload_template?: string }): Promise<CRMWebhook> {
 	return request('/crm-webhooks', { method: 'POST', body: JSON.stringify(data) });
 }
 
-export async function updateCRMWebhook(id: string, data: { name: string; webhook_url: string; min_score: number; enabled: boolean }): Promise<void> {
+export async function updateCRMWebhook(id: string, data: { name: string; webhook_url: string; min_score: number; enabled: boolean; payload_template?: string }): Promise<void> {
 	await request(`/crm-webhooks/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function getDeadLetters(): Promise<{ dead_letters: import('./types').DeadLetter[] }> {
+	return request('/crm-webhooks/dead-letters');
 }
 
 export async function deleteCRMWebhook(id: string): Promise<void> {
@@ -440,7 +444,10 @@ export async function listConnectors(): Promise<{ connectors: ConnectorInfo[] }>
 }
 
 // Campaigns
-export async function listCampaigns(): Promise<{ campaigns: Campaign[] }> {
+export async function listCampaigns(): Promise<{
+	campaigns: Campaign[];
+	stats?: Record<string, { sessions: number; users: number; bounced: number; avg_pages: number }>;
+}> {
 	return request('/campaigns');
 }
 
@@ -545,4 +552,304 @@ export async function analyzeICP(conversionPaths: string[]): Promise<{ analysis:
 	} finally {
 		clearTimeout(timeout);
 	}
+}
+
+// --- ICP History ---
+
+export async function listICPAnalyses(): Promise<{ analyses: import('./types').SavedICPAnalysis[] }> {
+	return request('/icp/analyses');
+}
+
+export async function getICPAnalysis(id: string): Promise<import('./types').SavedICPAnalysis> {
+	return request(`/icp/analyses/${id}`);
+}
+
+export async function deleteICPAnalysis(id: string): Promise<void> {
+	await request(`/icp/analyses/${id}`, { method: 'DELETE' });
+}
+
+// --- Campaign Performance ---
+
+export async function getCampaignPerformance(
+	id: string,
+	params?: Record<string, string>,
+): Promise<{
+	campaign: import('./types').Campaign;
+	ref_code: string;
+	stats?: { sessions: number; users: number; bounced: number; avg_pages: number; event_count: number };
+	time_series?: { date: string; sessions: number; users: number }[];
+	posts?: import('./types').CampaignPost[];
+	channels?: { channel: string; sessions: number; users: number }[];
+	conversion_count?: number;
+	conversion_rate?: number;
+	conversion_event?: string;
+}> {
+	const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+	return request(`/campaigns/${id}/performance${qs}`);
+}
+
+// Billing usage (cloud only — gracefully returns null for self-hosted)
+export async function getBillingUsage(): Promise<{
+	tier: string;
+	period_start: string;
+	period_end: string;
+	usage: { events: number; leads: number; campaigns: number; icp_analyses: number };
+	limits: { free_events: number; free_leads: number; free_campaigns: number; free_icp: number };
+} | null> {
+	try {
+		return await request('/billing/usage');
+	} catch {
+		return null;
+	}
+}
+
+// --- Mentions ---
+
+export async function listMentions(
+	params?: Record<string, string>,
+): Promise<{ mentions: import('./types').MentionRecord[]; total: number }> {
+	const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+	return request(`/mentions${qs}`);
+}
+
+export async function getMention(id: string): Promise<import('./types').MentionRecord> {
+	return request(`/mentions/${id}`);
+}
+
+export async function updateMention(id: string, data: { status: string }): Promise<void> {
+	await request(`/mentions/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function draftMentionReply(id: string): Promise<{ reply: string }> {
+	const controller = new AbortController();
+	const t = setTimeout(() => controller.abort(), 30_000);
+	try {
+		const resp = await fetch(`${BASE}/mentions/${id}/draft`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			signal: controller.signal,
+		});
+		if (!resp.ok) {
+			const b = await resp.text();
+			throw new Error(`API error ${resp.status}: ${b}`);
+		}
+		return resp.json();
+	} finally {
+		clearTimeout(t);
+	}
+}
+
+export async function publishMentionReply(
+	id: string,
+	data: { publisher_name: string; reply_text?: string },
+): Promise<void> {
+	await request(`/mentions/${id}/reply`, { method: 'POST', body: JSON.stringify(data) });
+}
+
+// --- Sources ---
+
+export async function listSources(): Promise<{ sources: import('./types').SourceInfo[] }> {
+	return request('/sources');
+}
+
+export async function triggerSourceSearch(name: string): Promise<{ found: number }> {
+	return request(`/sources/${name}/search`, { method: 'POST' });
+}
+
+export async function listSourceConfigs(): Promise<{
+	configs: import('./types').SourceConfig[];
+}> {
+	return request('/source-configs');
+}
+
+export async function upsertSourceConfig(data: {
+	source_name: string;
+	keywords: string[];
+	schedule_minutes: number;
+	enabled: boolean;
+}): Promise<void> {
+	await request('/source-configs', { method: 'POST', body: JSON.stringify(data) });
+}
+
+// --- Source credentials / OAuth ---
+
+export async function getSourceCredentials(name: string): Promise<import('./types').SourceCredentialStatus> {
+	return request(`/sources/${name}/credentials`);
+}
+
+export async function saveSourceCredentials(name: string, data: { access_token?: string; refresh_token?: string }): Promise<{ connected: boolean; username: string }> {
+	return request(`/sources/${name}/credentials`, { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function deleteSourceCredentials(name: string): Promise<{ ok: boolean }> {
+	return request(`/sources/${name}/credentials`, { method: 'DELETE' });
+}
+
+export async function getSourceOAuthUrl(name: string): Promise<{ oauth_available: boolean; url?: string }> {
+	return request(`/sources/${name}/oauth/authorize`);
+}
+
+// --- Campaign publish / engagement ---
+
+export async function publishCampaign(
+	id: string,
+	data: { publisher_name: string; content_override?: string },
+): Promise<{ external_id: string; external_url: string }> {
+	return request(`/campaigns/${id}/publish`, { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function refreshCampaignEngagement(id: string): Promise<{ refreshed: number }> {
+	return request(`/campaigns/${id}/refresh-engagement`, { method: 'POST' });
+}
+
+// --- Webhook deliveries ---
+
+export async function listWebhookDeliveries(
+	webhookId: string,
+): Promise<{ deliveries: import('./types').WebhookDelivery[] }> {
+	return request(`/crm-webhooks/${webhookId}/deliveries`);
+}
+
+export async function retryWebhookDelivery(
+	webhookId: string,
+	deliveryId: string,
+): Promise<{ success: boolean; status_code: number }> {
+	return request(`/crm-webhooks/${webhookId}/deliveries/${deliveryId}/retry`, { method: 'POST' });
+}
+
+// --- ICP → actions ---
+
+export async function icpGenerateCampaign(
+	analysisId: string,
+	channel: string,
+): Promise<{ campaign: import('./types').Campaign; content: import('./types').CampaignContent; ref_code: string }> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 60_000);
+	try {
+		const resp = await fetch(`/api/v1/icp/analyses/${analysisId}/generate-campaign`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ channel }),
+			signal: controller.signal,
+		});
+		if (!resp.ok) {
+			const b = await resp.text();
+			throw new Error(`API error ${resp.status}: ${b}`);
+		}
+		return resp.json();
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+export async function icpCreateScoringRules(analysisId: string): Promise<{ created: number }> {
+	return request(`/icp/analyses/${analysisId}/create-scoring-rules`, { method: 'POST' });
+}
+
+// --- Lead score history + attribution ---
+
+export async function getLeadScoreHistory(distinctId: string): Promise<{ history: import('./types').LeadScoreSnapshot[] }> {
+	return request(`/leads/${encodeURIComponent(distinctId)}/score-history`);
+}
+
+export async function getLeadAttribution(distinctId: string): Promise<{ sources: import('./types').LeadAttribution[] }> {
+	return request(`/leads/${encodeURIComponent(distinctId)}/attribution`);
+}
+
+// --- Segments ---
+
+export async function listSegments(): Promise<{ segments: import('./types').Segment[] }> {
+	return request('/segments');
+}
+
+export async function createSegment(data: { name: string; conditions: string }): Promise<import('./types').Segment> {
+	return request('/segments', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function deleteSegment(id: string): Promise<void> {
+	await request(`/segments/${id}`, { method: 'DELETE' });
+}
+
+export async function getSegmentMembers(id: string): Promise<{ members: import('./types').ScoredLead[]; total: number }> {
+	return request(`/segments/${id}/members`);
+}
+
+// --- ICP settings ---
+
+export async function getICPSettings(): Promise<{ icp_auto_refresh: boolean }> {
+	return request('/icp/settings');
+}
+
+export async function putICPSettings(settings: { icp_auto_refresh: boolean }): Promise<void> {
+	await request('/icp/settings', { method: 'PUT', body: JSON.stringify(settings) });
+}
+
+// --- Conversion Goals ---
+
+export async function listConversionGoals(): Promise<{ goals: import('./types').ConversionGoal[] }> {
+	return request('/conversion-goals');
+}
+
+export async function createConversionGoal(data: { name: string; event_type: string; event_name: string; url_pattern: string; value_property: string }): Promise<import('./types').ConversionGoal> {
+	return request('/conversion-goals', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function getConversionGoal(id: string): Promise<import('./types').ConversionGoal> {
+	return request(`/conversion-goals/${id}`);
+}
+
+export async function updateConversionGoal(id: string, data: { name: string; event_type: string; event_name: string; url_pattern: string; value_property: string }): Promise<void> {
+	await request(`/conversion-goals/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function deleteConversionGoal(id: string): Promise<void> {
+	await request(`/conversion-goals/${id}`, { method: 'DELETE' });
+}
+
+export async function getConversionGoalResults(id: string, params?: Record<string, string>): Promise<{ goal: import('./types').ConversionGoal; model: string; attributions: import('./types').ConversionAttribution[]; total_conversions: number; total_revenue: number }> {
+	const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+	return request(`/conversion-goals/${id}/results${qs}`);
+}
+
+export async function getRevenueAttribution(params?: Record<string, string>): Promise<{ total_conversions: number; total_revenue: number; by_channel: import('./types').ConversionAttribution[] }> {
+	const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+	return request(`/attribution/revenue${qs}`);
+}
+
+// --- Experiments ---
+
+export async function listExperiments(): Promise<{ experiments: import('./types').Experiment[] }> {
+	return request('/experiments');
+}
+
+export async function createExperiment(data: { name: string; flag_key: string; variants: string[]; conversion_goal_id?: string; auto_stop?: boolean }): Promise<import('./types').Experiment> {
+	return request('/experiments', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function getExperiment(id: string): Promise<import('./types').Experiment> {
+	return request(`/experiments/${id}`);
+}
+
+export async function updateExperiment(id: string, data: { name: string; status: string; auto_stop: boolean; conversion_goal_id: string }): Promise<void> {
+	await request(`/experiments/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function deleteExperiment(id: string): Promise<void> {
+	await request(`/experiments/${id}`, { method: 'DELETE' });
+}
+
+export async function getExperimentResults(id: string): Promise<import('./types').ExperimentResults> {
+	return request(`/experiments/${id}/results`);
+}
+
+export async function getExperimentSampleSize(id: string): Promise<{ sample_size_needed: number; current_max_exposures: number; remaining: number }> {
+	return request(`/experiments/${id}/sample-size`);
+}
+
+export async function stopExperiment(id: string): Promise<void> {
+	await request(`/experiments/${id}/stop`, { method: 'POST' });
+}
+
+export async function declareWinner(id: string, variant: string): Promise<void> {
+	await request(`/experiments/${id}/declare-winner`, { method: 'POST', body: JSON.stringify({ variant }) });
 }

@@ -1,0 +1,1 @@
+ALTER TABLE crm_webhooks ADD COLUMN secret TEXT NOT NULL DEFAULT '';

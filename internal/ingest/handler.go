@@ -39,6 +39,11 @@ type IngestPayload struct {
 type Handler struct {
 	events *storage.DuckDB
 	namer  *ai.Namer
+
+	// OnIngested is called in a goroutine after events are successfully written.
+	// It receives the project ID and the number of events accepted.
+	// Used by EE to record usage in the control-plane database.
+	OnIngested func(projectID string, count int64)
 }
 
 func NewHandler(events *storage.DuckDB, namer *ai.Namer) *Handler {
@@ -110,6 +115,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ERROR inserting events: %v", err)
 		http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
 		return
+	}
+
+	if h.OnIngested != nil {
+		go h.OnIngested(project.ID, int64(len(events)))
 	}
 
 	// Submit naming jobs for interaction events (not pageviews).

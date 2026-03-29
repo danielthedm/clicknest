@@ -35,6 +35,16 @@ func (h *Handler) LeadScoresHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enrich with score deltas from yesterday's snapshot.
+	if snapshots, err := h.meta.GetYesterdayScores(r.Context(), project.ID); err == nil && len(snapshots) > 0 {
+		for i := range leads {
+			if prev, ok := snapshots[leads[i].DistinctID]; ok {
+				delta := leads[i].Score - prev
+				leads[i].ScoreDelta = &delta
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"leads": leads, "total": total})
 }

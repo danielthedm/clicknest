@@ -257,6 +257,9 @@ export interface ScoringRule {
 export interface ScoredLead {
 	distinct_id: string;
 	score: number;
+	raw_score: number;
+	score_delta?: number; // change vs yesterday's snapshot; undefined if no snapshot
+	days_since_last_seen: number;
 	event_count: number;
 	session_count: number;
 	page_views: number;
@@ -266,6 +269,34 @@ export interface ScoredLead {
 	properties?: Record<string, unknown>;
 }
 
+export interface LeadScoreSnapshot {
+	id: string;
+	project_id: string;
+	distinct_id: string;
+	score: number;
+	raw_score: number;
+	snapshot_date: string;
+	created_at: string;
+}
+
+export interface LeadAttribution {
+	source: string;
+	channel: string;
+	campaign?: string;
+	sessions: number;
+	first_touch: string;
+	last_touch: string;
+}
+
+export interface Segment {
+	id: string;
+	project_id: string;
+	name: string;
+	conditions: string; // JSON
+	created_at: string;
+	updated_at: string;
+}
+
 export interface CRMWebhook {
 	id: string;
 	project_id: string;
@@ -273,9 +304,24 @@ export interface CRMWebhook {
 	webhook_url: string;
 	min_score: number;
 	enabled: boolean;
+	payload_template?: string;
 	last_pushed_at?: string;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface DeadLetter {
+	id: string;
+	webhook_id: string;
+	webhook_name: string;
+	project_id: string;
+	lead_count: number;
+	status_code: number;
+	response_body: string;
+	error: string;
+	success: boolean;
+	attempt: number;
+	created_at: string;
 }
 
 export interface Campaign {
@@ -287,8 +333,21 @@ export interface Campaign {
 	status: string;
 	content: string;
 	ai_prompt: string;
+	cost: number;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface CampaignPost {
+	id: string;
+	campaign_id: string;
+	project_id: string;
+	connector_name: string;
+	external_id: string;
+	external_url: string;
+	posted_at: string;
+	last_engagement: string;
+	last_fetched_at?: string;
 }
 
 export interface CampaignContent {
@@ -318,6 +377,18 @@ export interface ICPUserProfile {
 	entry_source: string;
 }
 
+export interface SavedICPAnalysis {
+	id: string;
+	project_id: string;
+	conversion_pages: string;
+	summary: string;
+	traits: string;
+	channels: string;
+	recommendations: string;
+	profile_count: number;
+	created_at: string;
+}
+
 export interface ABVariation {
 	flag_key: string;
 	content: string;
@@ -337,4 +408,124 @@ export interface MeResponse {
 	user_id: string;
 	active_project?: { id: string; name: string };
 	projects: { id: string; name: string }[];
+}
+
+export interface MentionRecord {
+	id: string;
+	project_id: string;
+	source_name: string;
+	external_id: string;
+	external_url: string;
+	author: string;
+	title: string;
+	content: string;
+	relevance_score: number;
+	status: 'new' | 'reviewed' | 'replied' | 'dismissed' | 'lead';
+	suggested_reply: string;
+	parent_id: string;
+	metadata: string;
+	posted_at?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface SourceInfo {
+	name: string;
+	display_name: string;
+}
+
+export interface SourceCredentialStatus {
+	connected: boolean;
+	username?: string;
+	connected_at?: string;
+}
+
+export interface SourceConfig {
+	id: string;
+	project_id: string;
+	source_name: string;
+	keywords: string;
+	filters: string;
+	schedule_minutes: number;
+	enabled: boolean;
+	last_run_at?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface WebhookDelivery {
+	id: string;
+	webhook_id: string;
+	project_id: string;
+	lead_count: number;
+	status_code: number;
+	response_body: string;
+	error: string;
+	success: boolean;
+	attempt: number;
+	created_at: string;
+}
+
+export interface ConversionGoal {
+	id: string;
+	project_id: string;
+	name: string;
+	event_type: string;
+	event_name: string;
+	url_pattern: string;
+	value_property: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ConversionAttribution {
+	source: string;
+	channel: string;
+	campaign: string;
+	conversions: number;
+	revenue: number;
+	users: number;
+}
+
+export interface Experiment {
+	id: string;
+	project_id: string;
+	name: string;
+	flag_key: string;
+	variants: string;
+	conversion_goal_id?: string;
+	status: string;
+	auto_stop: boolean;
+	started_at: string;
+	ended_at?: string;
+	winner_variant?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ExperimentVariantResult {
+	variant: string;
+	exposures: number;
+	conversions: number;
+	conversion_rate: number;
+	revenue: number;
+	confidence_low: number;
+	confidence_high: number;
+}
+
+export interface ExperimentResults {
+	experiment: Experiment;
+	variants: ExperimentVariantResult[];
+	significance?: {
+		z_score: number;
+		p_value: number;
+		significant: boolean;
+	};
+	chi_squared?: {
+		chi_squared: number;
+		p_value: number;
+		significant: boolean;
+	};
+	sample_size_needed: number;
+	winner?: string;
 }
