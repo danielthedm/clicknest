@@ -2935,6 +2935,13 @@ func (s *Server) storageHandler(w http.ResponseWriter, r *http.Request) {
 		FreeBytes   int64 `json:"free_bytes"`
 	}
 
+	// In cloud mode, don't expose shared infrastructure storage details.
+	if s.config.CloudMode {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(storageInfo{})
+		return
+	}
+
 	info := storageInfo{}
 
 	fileSize := func(path string) int64 {

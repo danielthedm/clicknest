@@ -2,12 +2,23 @@
 	import { page } from '$app/stores';
 	let { children } = $props();
 
-	const tabs = [
+	import { onMount } from 'svelte';
+	import { getBillingUsage } from '$lib/api';
+
+	let isCloud = $state(false);
+
+	onMount(async () => {
+		const billing = await getBillingUsage();
+		isCloud = billing !== null;
+	});
+
+	let tabs = $derived([
 		{ href: '/platform/dashboards', label: 'Dashboards' },
 		{ href: '/platform/flags', label: 'Flags' },
 		{ href: '/platform/experiments', label: 'Experiments' },
+		...(isCloud ? [{ href: '/platform/billing', label: 'Billing' }] : []),
 		{ href: '/platform/settings', label: 'Settings' },
-	];
+	]);
 </script>
 
 <div class="flex flex-col h-full">

@@ -603,6 +603,20 @@ export async function getBillingUsage(): Promise<{
 	}
 }
 
+export async function createBillingPortal(returnURL: string): Promise<{ url: string }> {
+	return request('/billing/portal', {
+		method: 'POST',
+		body: JSON.stringify({ return_url: returnURL }),
+	});
+}
+
+export async function createCheckout(successURL: string, cancelURL: string): Promise<{ url: string }> {
+	return request('/billing/checkout', {
+		method: 'POST',
+		body: JSON.stringify({ success_url: successURL, cancel_url: cancelURL }),
+	});
+}
+
 // --- Mentions ---
 
 export async function listMentions(

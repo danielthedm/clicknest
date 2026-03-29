@@ -486,8 +486,8 @@
 		</div>
 	{/if}
 
-	<!-- Storage -->
-	{#if storage}
+	<!-- Storage (hidden in cloud mode where all values are zero) -->
+	{#if storage && storage.volume_bytes > 0}
 	{@const usedPct = storage.volume_bytes > 0 ? (storage.total_bytes / storage.volume_bytes) * 100 : 0}
 	{@const barColor = usedPct > 85 ? 'bg-red-500' : usedPct > 70 ? 'bg-yellow-500' : 'bg-primary'}
 	<div class="border border-border rounded-lg p-5 bg-card mb-6">
