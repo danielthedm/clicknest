@@ -151,6 +151,11 @@ func (s *Server) routes() {
 	})
 	s.mux.Handle("POST /api/v1/events", apiKeyAuth(rateLimitedIngest))
 
+	// Inbound lead ingestion (API key auth). External services like Gojiberry,
+	// Typeform, etc. can POST leads here. Creates synthetic events so the
+	// existing lead scoring system picks them up automatically.
+	s.mux.Handle("POST /api/v1/leads/ingest", apiKeyAuth(http.HandlerFunc(s.ingestLeadsHandler)))
+
 	// Dashboard query endpoints (session auth + per-project concurrent query limit).
 	ql := s.withQueryLimit
 	s.mux.Handle("GET /api/v1/events", sessionAuth(ql(http.HandlerFunc(queryHandler.EventsHandler))))
@@ -4293,6 +4298,119 @@ func (s *Server) validateSourceToken(ctx context.Context, sourceName, accessToke
 	default:
 		return "", fmt.Errorf("unsupported source: %s", sourceName)
 	}
+}
+
+// ---- Inbound lead ingestion -------------------------------------------------
+
+func (s *Server) ingestLeadsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	var payload struct {
+		Leads []struct {
+			Email      string         `json:"email"`
+			Name       string         `json:"name,omitempty"`
+			Source     string         `json:"source,omitempty"`
+			Attributes map[string]any `json:"attributes,omitempty"`
+		} `json:"leads"`
+		// Single-lead shorthand (no wrapping array needed).
+		Email      string         `json:"email,omitempty"`
+		Name       string         `json:"name,omitempty"`
+		Source     string         `json:"source,omitempty"`
+		Attributes map[string]any `json:"attributes,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Support both single-lead and batch formats.
+	leads := payload.Leads
+	if len(leads) == 0 && payload.Email != "" {
+		leads = append(leads, struct {
+			Email      string         `json:"email"`
+			Name       string         `json:"name,omitempty"`
+			Source     string         `json:"source,omitempty"`
+			Attributes map[string]any `json:"attributes,omitempty"`
+		}{
+			Email:      payload.Email,
+			Name:       payload.Name,
+			Source:     payload.Source,
+			Attributes: payload.Attributes,
+		})
+	}
+
+	if len(leads) == 0 {
+		http.Error(w, `{"error":"at least one lead with an email is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	if len(leads) > 1000 {
+		http.Error(w, `{"error":"max 1000 leads per request"}`, http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC()
+	events := make([]storage.Event, 0, len(leads))
+
+	for _, lead := range leads {
+		if lead.Email == "" {
+			continue
+		}
+
+		props := make(map[string]any)
+		if lead.Name != "" {
+			props["name"] = lead.Name
+		}
+		if lead.Source != "" {
+			props["source"] = lead.Source
+		}
+		props["email"] = lead.Email
+		for k, v := range lead.Attributes {
+			props[k] = v
+		}
+
+		events = append(events, storage.Event{
+			ProjectID:  project.ID,
+			SessionID:  "ext_" + lead.Email,
+			DistinctID: lead.Email,
+			EventType:  "identify",
+			URL:        "external://" + lead.Source,
+			URLPath:    "/external/" + lead.Source,
+			Timestamp:  now,
+			Properties: props,
+		})
+	}
+
+	if len(events) == 0 {
+		http.Error(w, `{"error":"no valid leads (email required)"}`, http.StatusBadRequest)
+		return
+	}
+
+	if err := s.events.InsertEvents(r.Context(), events); err != nil {
+		log.Printf("ERROR inserting external leads: %v", err)
+		http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if s.config.OnEventIngested != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			s.config.OnEventIngested(ctx, project.ID, int64(len(events)))
+		}()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":   "ok",
+		"accepted": len(events),
+	})
 }
 
 // ---- Lead score history + attribution handlers --------------------------------
