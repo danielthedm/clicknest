@@ -4028,11 +4028,20 @@ func (s *Server) sourceOAuthAuthorizeHandler(w http.ResponseWriter, r *http.Requ
 	rand.Read(stateBytes)
 	state := hex.EncodeToString(stateBytes)
 
-	scheme := "https"
-	if r.TLS == nil && !s.config.CloudMode {
-		scheme = "http"
+	var redirectURI string
+	if s.config.CloudMode && s.config.ControlPlaneURL != "" {
+		// Route OAuth through the control plane proxy so all instances
+		// share a single redirect URI registered with the provider.
+		slug := strings.Split(r.Host, ".")[0]
+		state = slug + "--" + state
+		redirectURI = s.config.ControlPlaneURL + "/api/v1/oauth/" + name + "/callback"
+	} else {
+		scheme := "https"
+		if r.TLS == nil {
+			scheme = "http"
+		}
+		redirectURI = fmt.Sprintf("%s://%s/api/v1/sources/%s/oauth/callback", scheme, r.Host, name)
 	}
-	redirectURI := fmt.Sprintf("%s://%s/api/v1/sources/%s/oauth/callback", scheme, r.Host, name)
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -4112,11 +4121,18 @@ func (s *Server) sourceOAuthCallbackHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	scheme := "https"
-	if r.TLS == nil && !s.config.CloudMode {
-		scheme = "http"
+	// The redirect URI for token exchange must match the one used in the
+	// authorization request. In cloud mode that's the control plane proxy.
+	var redirectURI string
+	if s.config.CloudMode && s.config.ControlPlaneURL != "" {
+		redirectURI = s.config.ControlPlaneURL + "/api/v1/oauth/" + name + "/callback"
+	} else {
+		scheme := "https"
+		if r.TLS == nil {
+			scheme = "http"
+		}
+		redirectURI = fmt.Sprintf("%s://%s/api/v1/sources/%s/oauth/callback", scheme, r.Host, name)
 	}
-	redirectURI := fmt.Sprintf("%s://%s/api/v1/sources/%s/oauth/callback", scheme, r.Host, name)
 
 	var accessToken, refreshToken, username string
 
