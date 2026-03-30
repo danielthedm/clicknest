@@ -3402,9 +3402,17 @@ func (s *Server) listSourcesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sources := s.registry.ListSources()
-	result := make([]map[string]string, len(sources))
+	result := make([]map[string]any, len(sources))
 	for i, src := range sources {
-		result[i] = map[string]string{"name": src.Name(), "display_name": src.DisplayName()}
+		requiresAuth := true
+		if ra, ok := src.(interface{ RequiresAuth() bool }); ok {
+			requiresAuth = ra.RequiresAuth()
+		}
+		result[i] = map[string]any{
+			"name":          src.Name(),
+			"display_name":  src.DisplayName(),
+			"requires_auth": requiresAuth,
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"sources": result})

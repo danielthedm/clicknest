@@ -331,16 +331,18 @@
 								onclick={() => startConfigure(src.name)}
 								class="text-xs text-primary hover:underline"
 							>Configure</button>
-							{#if cred?.connected}
-								<button
-									onclick={() => handleDisconnect(src.name)}
-									class="text-xs text-red-500 hover:underline"
-								>Disconnect</button>
-							{:else}
-								<button
-									onclick={() => startConnect(src.name)}
-									class="text-xs text-primary hover:underline"
-								>Connect account</button>
+							{#if src.requires_auth !== false}
+								{#if cred?.connected}
+									<button
+										onclick={() => handleDisconnect(src.name)}
+										class="text-xs text-red-500 hover:underline"
+									>Disconnect</button>
+								{:else}
+									<button
+										onclick={() => startConnect(src.name)}
+										class="text-xs text-primary hover:underline"
+									>Connect account</button>
+								{/if}
 							{/if}
 						</div>
 					</div>
