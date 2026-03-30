@@ -40,6 +40,7 @@ func main() {
 		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
 		InstanceID:      os.Getenv("INSTANCE_ID"),
 		InstanceSecret:  os.Getenv("INSTANCE_SECRET"),
+		Version:         "0.3.0",
 	})
 	defer app.Close()
 

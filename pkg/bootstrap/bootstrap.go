@@ -23,6 +23,7 @@ import (
 	"github.com/danielthedm/clicknest/internal/growth"
 	"github.com/danielthedm/clicknest/internal/server"
 	"github.com/danielthedm/clicknest/internal/storage"
+	"github.com/danielthedm/clicknest/internal/telemetry"
 )
 
 // Config holds configuration for bootstrapping a ClickNest instance.
@@ -69,6 +70,9 @@ type Config struct {
 	// It receives the project ID and the number of events accepted.
 	// Used by EE to increment the monthly usage counter in PostgreSQL.
 	OnEventIngested func(ctx context.Context, projectID string, count int64)
+
+	// Version is the application version string for telemetry.
+	Version string
 
 	// OnReady is called after the server is configured but before it starts listening.
 	// Use this to inspect or modify startup behavior.
@@ -187,6 +191,25 @@ func Setup(cfg Config) *App {
 		RateLimitFn:        cfg.RateLimitFn,
 		OnEventIngested:    onEventIngested,
 	}, events, meta, namer, syncer, matcher, cfg.Registry)
+
+	// Start anonymous telemetry if not opted out.
+	if telemetry.Enabled() {
+		reporter := telemetry.New(cfg.DataDir, cfg.Version, func(ctx context.Context) map[string]any {
+			stats := map[string]any{}
+			if projects, err := meta.ListProjects(ctx); err == nil {
+				stats["projects"] = len(projects)
+			}
+			if users, err := meta.CountUsers(ctx); err == nil {
+				stats["users"] = users
+			}
+			stats["cloud_mode"] = cfg.CloudMode
+			stats["connectors"] = len(cfg.Registry.ListPublishers())
+			stats["sources"] = len(cfg.Registry.ListSources())
+			return stats
+		})
+		reporter.Start(context.Background())
+		log.Println("Anonymous telemetry enabled (disable with CLICKNEST_TELEMETRY=off)")
+	}
 
 	if cfg.OnReady != nil {
 		cfg.OnReady()
