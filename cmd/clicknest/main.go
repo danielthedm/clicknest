@@ -4,6 +4,7 @@ import (
 	"flag"
 	"io/fs"
 	"log"
+	"os"
 
 	"github.com/danielthedm/clicknest/pkg/bootstrap"
 )
@@ -30,11 +31,15 @@ func main() {
 	}
 
 	app := bootstrap.Setup(bootstrap.Config{
-		Addr:    *addr,
-		DataDir: *dataDir,
-		DevMode: *devMode,
-		WebFS:   webFS,
-		SDKJS:   sdkJS,
+		Addr:            *addr,
+		DataDir:         *dataDir,
+		DevMode:         *devMode,
+		WebFS:           webFS,
+		SDKJS:           sdkJS,
+		CloudMode:       os.Getenv("CLICKNEST_CLOUD") == "true",
+		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
+		InstanceID:      os.Getenv("INSTANCE_ID"),
+		InstanceSecret:  os.Getenv("INSTANCE_SECRET"),
 	})
 	defer app.Close()
 

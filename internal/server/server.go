@@ -45,6 +45,12 @@ type Config struct {
 	GitHubClientSecret string // GitHub OAuth app client secret
 	CloudMode          bool   // True when running as a managed cloud instance
 
+	// Single-tenant cloud instance fields. When ControlPlaneURL is set,
+	// this instance is a dedicated customer instance managed by the control plane.
+	ControlPlaneURL string // e.g. "https://api.clicknest.app"
+	InstanceID      string // UUID from the control plane
+	InstanceSecret  string // shared secret for control plane ↔ instance auth
+
 	// RouteHook is called at the end of route setup. EE code uses this
 	// to inject billing, signup, and instance routes into the shared mux.
 	RouteHook func(mux *http.ServeMux, meta *storage.SQLite)
@@ -352,8 +358,9 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/experiments/{id}/declare-winner", sessionAuth(http.HandlerFunc(s.declareWinnerHandler)))
 
 	// Backup / restore.
-	// Backup export/import — disabled in cloud mode to prevent leaking shared data.
-	if !s.config.CloudMode {
+	// Safe in single-tenant cloud instances (only one customer's data).
+	// Only disabled when CloudMode is set WITHOUT a ControlPlaneURL (legacy multi-tenant).
+	if !s.config.CloudMode || s.config.ControlPlaneURL != "" {
 		s.mux.Handle("GET /api/v1/export", sessionAuth(http.HandlerFunc(s.exportHandler)))
 		s.mux.Handle("POST /api/v1/import", sessionAuth(http.HandlerFunc(s.importHandler)))
 	}
@@ -366,9 +373,11 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/github/oauth/authorize", sessionAuth(http.HandlerFunc(s.githubOAuthAuthorizeHandler)))
 	s.mux.HandleFunc("GET /api/v1/github/oauth/callback", s.githubOAuthCallbackHandler) // No session auth — browser redirect from GitHub
 
-	// Auth (no session required). In cloud mode, signup/login are handled by EE RouteHook.
+	// Auth (no session required).
+	// In single-tenant cloud mode (ControlPlaneURL set), users log in at their instance,
+	// so setup/login are re-enabled. Only disabled in legacy multi-tenant CloudMode.
 	s.mux.HandleFunc("GET /api/v1/auth/setup-required", s.setupRequiredHandler)
-	if !s.config.CloudMode {
+	if !s.config.CloudMode || s.config.ControlPlaneURL != "" {
 		s.mux.HandleFunc("POST /api/v1/auth/setup", s.setupHandler)
 		s.mux.HandleFunc("POST /api/v1/auth/login", s.loginHandler)
 	}
@@ -415,6 +424,16 @@ func (s *Server) routes() {
 			"cloud_mode": s.config.CloudMode,
 		})
 	})
+
+	// Cloud instance routes — seed, token exchange, billing proxy.
+	// These only activate when this instance is managed by a control plane.
+	if s.config.ControlPlaneURL != "" {
+		s.mux.HandleFunc("POST /api/v1/internal/seed", s.handleSeed)
+		s.mux.HandleFunc("POST /api/v1/auth/token-exchange", s.handleTokenExchange)
+		s.mux.Handle("GET /api/v1/billing/usage", sessionAuth(http.HandlerFunc(s.handleBillingProxy)))
+		s.mux.Handle("POST /api/v1/billing/checkout", sessionAuth(http.HandlerFunc(s.handleBillingProxy)))
+		s.mux.Handle("POST /api/v1/billing/portal", sessionAuth(http.HandlerFunc(s.handleBillingProxy)))
+	}
 
 	// EE route injection — billing, signup, instance routes.
 	if s.config.RouteHook != nil {

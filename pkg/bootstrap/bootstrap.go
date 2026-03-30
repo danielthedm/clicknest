@@ -18,6 +18,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/danielthedm/clicknest/internal/ai"
+	"github.com/danielthedm/clicknest/internal/cloudreport"
 	ghub "github.com/danielthedm/clicknest/internal/github"
 	"github.com/danielthedm/clicknest/internal/growth"
 	"github.com/danielthedm/clicknest/internal/server"
@@ -37,6 +38,11 @@ type Config struct {
 
 	// CloudMode tells the frontend this is a cloud-managed instance.
 	CloudMode bool
+
+	// Single-tenant cloud instance fields.
+	ControlPlaneURL string // Control plane URL (e.g. "https://api.clicknest.app")
+	InstanceID      string // Instance UUID from the control plane
+	InstanceSecret  string // Shared secret for control plane ↔ instance auth
 
 	// RouteHook is called after OSS routes are registered. It receives
 	// the shared HTTP mux and the metadata store so that EE code can
@@ -145,6 +151,23 @@ func Setup(cfg Config) *App {
 	ghClientID := os.Getenv("GITHUB_CLIENT_ID")
 	ghClientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
 
+	// If this is a cloud instance with a control plane, set up the usage reporter
+	// to periodically flush event counts to the control plane for billing.
+	onEventIngested := cfg.OnEventIngested
+	if cfg.ControlPlaneURL != "" && cfg.InstanceID != "" && cfg.InstanceSecret != "" {
+		reporter := cloudreport.New(cfg.ControlPlaneURL, cfg.InstanceID, cfg.InstanceSecret)
+		reporter.Start(context.Background())
+
+		// Wrap or replace the OnEventIngested hook to also record to the reporter.
+		origHook := cfg.OnEventIngested
+		onEventIngested = func(ctx context.Context, projectID string, count int64) {
+			reporter.RecordEvents(count)
+			if origHook != nil {
+				origHook(ctx, projectID, count)
+			}
+		}
+	}
+
 	// Create HTTP server.
 	srv := server.New(server.Config{
 		Addr:               cfg.Addr,
@@ -155,11 +178,14 @@ func Setup(cfg Config) *App {
 		GitHubClientID:     ghClientID,
 		GitHubClientSecret: ghClientSecret,
 		CloudMode:          cfg.CloudMode,
+		ControlPlaneURL:    cfg.ControlPlaneURL,
+		InstanceID:         cfg.InstanceID,
+		InstanceSecret:     cfg.InstanceSecret,
 		RouteHook:          cfg.RouteHook,
 		ResourceLimitFn:    cfg.ResourceLimitFn,
 		RetentionDaysFn:    cfg.RetentionDaysFn,
 		RateLimitFn:        cfg.RateLimitFn,
-		OnEventIngested:    cfg.OnEventIngested,
+		OnEventIngested:    onEventIngested,
 	}, events, meta, namer, syncer, matcher, cfg.Registry)
 
 	if cfg.OnReady != nil {
