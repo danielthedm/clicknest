@@ -3716,6 +3716,9 @@ func (s *Server) publishMentionReplyHandler(w http.ResponseWriter, r *http.Reque
 // --- Source monitor background job ---
 
 func (s *Server) startSourceMonitor() {
+	// Run immediately on startup so auto_stop instances scan before being stopped.
+	go s.runSourceMonitor(context.Background())
+
 	ticker := time.NewTicker(10 * time.Minute)
 	go func() {
 		for range ticker.C {
