@@ -3762,6 +3762,7 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 				since = *cfg.LastRunAt
 			}
 
+			log.Printf("source monitor: searching %s for keywords %v", cfg.SourceName, keywords)
 			mentions, err := src.Search(ctx, growth.SearchQuery{
 				Keywords:    keywords,
 				Since:       since,
@@ -3772,6 +3773,7 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 				log.Printf("WARN source monitor: search failed for %s/%s: %v", proj.ID, cfg.SourceName, err)
 				continue
 			}
+			log.Printf("source monitor: %s returned %d mentions", cfg.SourceName, len(mentions))
 
 			for _, m := range mentions {
 				id, _ := generateID()
