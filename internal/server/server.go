@@ -294,6 +294,7 @@ func (s *Server) routes() {
 	// Source configs.
 	s.mux.Handle("GET /api/v1/source-configs", sessionAuth(http.HandlerFunc(s.listSourceConfigsHandler)))
 	s.mux.Handle("POST /api/v1/source-configs", sessionAuth(http.HandlerFunc(s.upsertSourceConfigHandler)))
+	s.mux.Handle("POST /api/v1/sources/reddit/suggest-subreddits", sessionAuth(http.HandlerFunc(s.suggestSubredditsHandler)))
 
 	// Mentions inbox.
 	s.mux.Handle("GET /api/v1/mentions", sessionAuth(http.HandlerFunc(s.listMentionsHandler)))
@@ -3440,8 +3441,14 @@ func (s *Server) triggerSourceSearchHandler(w http.ResponseWriter, r *http.Reque
 	var keywords []string
 	_ = json.Unmarshal([]byte(cfg.Keywords), &keywords)
 
+	var filters struct {
+		Subreddits []string `json:"subreddits"`
+	}
+	_ = json.Unmarshal([]byte(cfg.Filters), &filters)
+
 	mentions, err := src.Search(r.Context(), growth.SearchQuery{
 		Keywords:    keywords,
+		Subreddits:  filters.Subreddits,
 		MaxResults:  25,
 		ExtraFields: sourceCredentialFields(s.meta, r.Context(), project.ID, name),
 	})
@@ -3504,6 +3511,9 @@ func (s *Server) upsertSourceConfigHandler(w http.ResponseWriter, r *http.Reques
 		Keywords        []string `json:"keywords"`
 		ScheduleMinutes int      `json:"schedule_minutes"`
 		Enabled         bool     `json:"enabled"`
+		Filters         *struct {
+			Subreddits []string `json:"subreddits"`
+		} `json:"filters"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
@@ -3528,13 +3538,20 @@ func (s *Server) upsertSourceConfigHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	kwJSON, _ := json.Marshal(body.Keywords)
+
+	filtersJSON := "{}"
+	if body.Filters != nil {
+		b, _ := json.Marshal(body.Filters)
+		filtersJSON = string(b)
+	}
+
 	id, _ := generateID()
 	err := s.meta.UpsertSourceConfig(r.Context(), storage.SourceConfig{
 		ID:              id,
 		ProjectID:       project.ID,
 		SourceName:      body.SourceName,
 		Keywords:        string(kwJSON),
-		Filters:         "{}",
+		Filters:         filtersJSON,
 		ScheduleMinutes: body.ScheduleMinutes,
 		Enabled:         body.Enabled,
 	})
@@ -3544,6 +3561,44 @@ func (s *Server) upsertSourceConfigHandler(w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (s *Server) suggestSubredditsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	cfg, err := s.meta.GetLLMConfig(r.Context(), project.ID)
+	if err != nil || cfg.Provider == "" {
+		http.Error(w, `{"error":"LLM not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	proj, _ := s.meta.GetProject(r.Context(), project.ID)
+	desc := ""
+	if proj != nil {
+		desc = proj.Description
+	}
+
+	// Get the latest ICP traits if available.
+	icpTraits := ""
+	analyses, err := s.meta.ListICPAnalyses(r.Context(), project.ID, 1)
+	if err == nil && len(analyses) > 0 {
+		var traits []string
+		_ = json.Unmarshal([]byte(analyses[0].Traits), &traits)
+		icpTraits = strings.Join(traits, "; ")
+	}
+
+	suggestions, err := ai.SuggestSubreddits(r.Context(), cfg, desc, icpTraits)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"suggestion failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"subreddits": suggestions})
 }
 
 // --- Mention handlers ---
@@ -3757,6 +3812,11 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 			var keywords []string
 			_ = json.Unmarshal([]byte(cfg.Keywords), &keywords)
 
+			var filters struct {
+				Subreddits []string `json:"subreddits"`
+			}
+			_ = json.Unmarshal([]byte(cfg.Filters), &filters)
+
 			since := time.Now().Add(-24 * time.Hour)
 			if cfg.LastRunAt != nil {
 				since = *cfg.LastRunAt
@@ -3765,6 +3825,7 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 			log.Printf("source monitor: searching %s for keywords %v", cfg.SourceName, keywords)
 			mentions, err := src.Search(ctx, growth.SearchQuery{
 				Keywords:    keywords,
+				Subreddits:  filters.Subreddits,
 				Since:       since,
 				MaxResults:  25,
 				ExtraFields: sourceCredentialFields(s.meta, ctx, proj.ID, cfg.SourceName),

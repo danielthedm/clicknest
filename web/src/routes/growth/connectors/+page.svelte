@@ -11,6 +11,7 @@
 		saveSourceCredentials,
 		deleteSourceCredentials,
 		getSourceOAuthUrl,
+		suggestSubreddits,
 	} from '$lib/api';
 	import type { ConnectorInfo, SourceInfo, SourceConfig, SourceCredentialStatus } from '$lib/types';
 
@@ -26,6 +27,10 @@
 	let cfgKeywords = $state('');
 	let cfgSchedule = $state(60);
 	let cfgEnabled = $state(true);
+	let cfgSubreddits = $state<string[]>([]);
+	let newSubreddit = $state('');
+	let suggestingSubs = $state(false);
+	let suggestError = $state('');
 	let saving = $state(false);
 
 	// Credential modal state
@@ -101,12 +106,50 @@
 			cfgKeywords = kw.join(', ');
 			cfgSchedule = existing.schedule_minutes;
 			cfgEnabled = existing.enabled;
+			try {
+				const filters = JSON.parse(existing.filters || '{}');
+				cfgSubreddits = filters.subreddits ?? [];
+			} catch {
+				cfgSubreddits = [];
+			}
 		} else {
 			cfgKeywords = '';
 			cfgSchedule = 60;
 			cfgEnabled = true;
+			cfgSubreddits = [];
 		}
+		newSubreddit = '';
+		suggestError = '';
 		configuring = sourceName;
+	}
+
+	function addSubreddit() {
+		const sub = newSubreddit.trim().replace(/^r\//, '');
+		if (sub && !cfgSubreddits.includes(sub)) {
+			cfgSubreddits = [...cfgSubreddits, sub];
+		}
+		newSubreddit = '';
+	}
+
+	function removeSubreddit(sub: string) {
+		cfgSubreddits = cfgSubreddits.filter((s) => s !== sub);
+	}
+
+	async function handleSuggestSubreddits() {
+		suggestingSubs = true;
+		suggestError = '';
+		try {
+			const res = await suggestSubreddits();
+			const existing = new Set(cfgSubreddits);
+			for (const s of res.subreddits) {
+				if (!existing.has(s.name)) {
+					cfgSubreddits = [...cfgSubreddits, s.name];
+				}
+			}
+		} catch (e: any) {
+			suggestError = e?.message ?? 'Suggestion failed. Is AI configured in Settings?';
+		}
+		suggestingSubs = false;
 	}
 
 	async function handleSaveConfig() {
@@ -120,6 +163,7 @@
 			await upsertSourceConfig({
 				source_name: configuring,
 				keywords,
+				filters: configuring === 'reddit' ? { subreddits: cfgSubreddits } : undefined,
 				schedule_minutes: cfgSchedule,
 				enabled: cfgEnabled,
 			});
@@ -321,7 +365,11 @@
 						</div>
 						{#if cfg}
 							{@const kw = JSON.parse(cfg.keywords || '[]')}
+							{@const cfgFilters = (() => { try { return JSON.parse(cfg.filters || '{}'); } catch { return {}; } })()}
 							<div class="text-xs text-muted-foreground space-y-0.5 mb-2">
+								{#if cfgFilters.subreddits?.length > 0}
+									<p>Subreddits: {cfgFilters.subreddits.map((s: string) => 'r/' + s).join(', ')}</p>
+								{/if}
 								<p>Keywords: {kw.length > 0 ? kw.join(', ') : 'none'}</p>
 								<p>Schedule: every {cfg.schedule_minutes}m</p>
 							</div>
@@ -356,6 +404,41 @@
 		<div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
 			<div class="bg-background border border-border rounded-lg p-6 w-full max-w-md space-y-4">
 				<h3 class="font-medium">Configure {configuring}</h3>
+
+				{#if configuring === 'reddit'}
+				<div>
+					<label class="text-sm font-medium block mb-1">Subreddits</label>
+					<div class="flex gap-2 mb-2">
+						<input
+							type="text"
+							bind:value={newSubreddit}
+							placeholder="e.g. selfhosted"
+							onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addSubreddit(); } }}
+							class="flex-1 text-sm border border-border rounded-md px-3 py-2 bg-background"
+						/>
+						<button onclick={addSubreddit}
+							class="text-sm px-3 py-1.5 border border-border rounded-md hover:bg-muted">Add</button>
+					</div>
+					{#if cfgSubreddits.length > 0}
+						<div class="flex flex-wrap gap-1 mb-2">
+							{#each cfgSubreddits as sub}
+								<span class="text-xs px-2 py-1 bg-muted rounded-full flex items-center gap-1">
+									r/{sub}
+									<button onclick={() => removeSubreddit(sub)} class="text-muted-foreground hover:text-foreground">&times;</button>
+								</span>
+							{/each}
+						</div>
+					{/if}
+					<button
+						onclick={handleSuggestSubreddits}
+						disabled={suggestingSubs}
+						class="text-xs text-primary hover:underline disabled:opacity-50"
+					>{suggestingSubs ? 'Suggesting...' : 'Suggest subreddits with AI'}</button>
+					{#if suggestError}
+						<p class="text-xs text-red-500 mt-1">{suggestError}</p>
+					{/if}
+				</div>
+				{/if}
 
 				<div>
 					<label class="text-sm font-medium block mb-1">Keywords (comma-separated)</label>

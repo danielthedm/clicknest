@@ -679,10 +679,17 @@ export async function listSourceConfigs(): Promise<{
 export async function upsertSourceConfig(data: {
 	source_name: string;
 	keywords: string[];
+	filters?: { subreddits?: string[] };
 	schedule_minutes: number;
 	enabled: boolean;
 }): Promise<void> {
 	await request('/source-configs', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function suggestSubreddits(): Promise<{
+	subreddits: { name: string; reason: string }[];
+}> {
+	return request('/sources/reddit/suggest-subreddits', { method: 'POST' });
 }
 
 // --- Source credentials / OAuth ---

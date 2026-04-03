@@ -35,6 +35,7 @@ type Source interface {
 type SearchQuery struct {
 	Keywords    []string          `json:"keywords"`
 	Subreddit   string            `json:"subreddit,omitempty"`
+	Subreddits  []string          `json:"subreddits,omitempty"`
 	Since       time.Time         `json:"since,omitempty"`
 	MaxResults  int               `json:"max_results,omitempty"`
 	ExtraFields map[string]string `json:"extra_fields,omitempty"`
