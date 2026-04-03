@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -236,7 +237,8 @@ func (s *SQLite) GetLLMConfig(ctx context.Context, projectID string) (*LLMConfig
 		projectID,
 	).Scan(&c.ProjectID, &c.Provider, &c.APIKey, &c.Model, &c.BaseURL)
 	if err != nil {
-		return nil, err
+		// Fall back to environment defaults (used by cloud instances).
+		return defaultLLMConfig(projectID)
 	}
 	decKey, err := s.enc.DecryptPtr(c.APIKey)
 	if err != nil {
@@ -244,6 +246,33 @@ func (s *SQLite) GetLLMConfig(ctx context.Context, projectID string) (*LLMConfig
 	}
 	c.APIKey = decKey
 	return &c, nil
+}
+
+// defaultLLMConfig returns an LLMConfig from environment variables if set.
+// This allows cloud instances to provide AI without requiring user configuration.
+func defaultLLMConfig(projectID string) (*LLMConfig, error) {
+	provider := os.Getenv("DEFAULT_LLM_PROVIDER")
+	apiKey := os.Getenv("DEFAULT_LLM_API_KEY")
+	model := os.Getenv("DEFAULT_LLM_MODEL")
+	if provider == "" || apiKey == "" {
+		return nil, fmt.Errorf("no LLM config found")
+	}
+	if model == "" {
+		switch provider {
+		case "anthropic":
+			model = "claude-sonnet-4-20250514"
+		case "openai":
+			model = "gpt-4o-mini"
+		default:
+			model = "gpt-4o-mini"
+		}
+	}
+	return &LLMConfig{
+		ProjectID: projectID,
+		Provider:  provider,
+		APIKey:    &apiKey,
+		Model:     model,
+	}, nil
 }
 
 func (s *SQLite) SetLLMConfig(ctx context.Context, c LLMConfig) error {
