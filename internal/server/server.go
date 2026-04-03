@@ -3836,7 +3836,57 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 			}
 			log.Printf("source monitor: %s returned %d mentions", cfg.SourceName, len(mentions))
 
+			// Try AI relevance scoring if LLM is configured.
+			llmCfg, _ := s.meta.GetLLMConfig(ctx, proj.ID)
+			scores := map[string]ai.ScoredMention{}
+			if llmCfg != nil && len(mentions) > 0 {
+				projectDesc := ""
+				if p, err := s.meta.GetProject(ctx, proj.ID); err == nil && p != nil {
+					projectDesc = p.Description
+				}
+				icpTraits := ""
+				if analyses, err := s.meta.ListICPAnalyses(ctx, proj.ID, 1); err == nil && len(analyses) > 0 {
+					var traits []string
+					_ = json.Unmarshal([]byte(analyses[0].Traits), &traits)
+					icpTraits = strings.Join(traits, "; ")
+				}
+
+				batch := make([]ai.MentionForScoring, 0, len(mentions))
+				for _, m := range mentions {
+					sub := ""
+					if md, ok := m.Metadata["subreddit"]; ok {
+						sub = md
+					}
+					batch = append(batch, ai.MentionForScoring{
+						ExternalID: m.ExternalID,
+						Title:      m.Title,
+						Content:    m.Content,
+						Subreddit:  sub,
+					})
+				}
+
+				scored, err := ai.ScoreMentionRelevance(ctx, llmCfg, batch, projectDesc, icpTraits, keywords)
+				if err != nil {
+					log.Printf("WARN source monitor: AI scoring failed for %s: %v", cfg.SourceName, err)
+				} else {
+					for _, s := range scored {
+						scores[s.ExternalID] = s
+					}
+					log.Printf("source monitor: AI scored %d mentions for %s", len(scored), cfg.SourceName)
+				}
+			}
+
 			for _, m := range mentions {
+				relevance := scoreRelevance(m.Content, m.Title, keywords)
+
+				// Use AI score if available, skip low-relevance mentions.
+				if sc, ok := scores[m.ExternalID]; ok {
+					relevance = sc.Score
+					if relevance < 0.3 {
+						continue
+					}
+				}
+
 				id, _ := generateID()
 				_ = s.meta.UpsertMention(ctx, storage.MentionRecord{
 					ID:             id,
@@ -3847,7 +3897,7 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 					Author:         m.Author,
 					Title:          m.Title,
 					Content:        m.Content,
-					RelevanceScore: scoreRelevance(m.Content, m.Title, keywords),
+					RelevanceScore: relevance,
 					ParentID:       m.ParentID,
 					Metadata:       "{}",
 					PostedAt:       &m.PostedAt,
