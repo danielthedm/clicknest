@@ -24,6 +24,7 @@ export interface Event {
 	received_at: string;
 	properties?: Record<string, unknown>;
 	source_file?: string;
+	source_url?: string;
 }
 
 export interface TrendPoint {

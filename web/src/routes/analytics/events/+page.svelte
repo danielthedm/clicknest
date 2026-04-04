@@ -383,7 +383,11 @@
 								<td class="px-4 py-2.5 max-w-xs truncate {event.event_name ? 'font-medium' : 'text-muted-foreground'}">
 									{eventDisplayName(event)}{#if group.count > 1}<span class="ml-1.5 text-xs text-muted-foreground font-normal">x{group.count}</span>{/if}
 									{#if event.source_file}
-										<span class="ml-1.5 text-[10px] text-muted-foreground font-mono opacity-60">{event.source_file.split('/').pop()}</span>
+										{#if event.source_url}
+											<a href={event.source_url} target="_blank" rel="noopener" class="ml-1.5 text-[10px] text-primary font-mono hover:underline">{event.source_file.split('/').pop()}</a>
+										{:else}
+											<span class="ml-1.5 text-[10px] text-muted-foreground font-mono opacity-60">{event.source_file.split('/').pop()}</span>
+										{/if}
 									{/if}
 								</td>
 								<td class="px-4 py-2.5 text-muted-foreground truncate max-w-[200px]">{event.url_path}</td>
@@ -399,10 +403,22 @@
 									{/if}
 								</td>
 							</tr>
-							{#if expandedRow === event.id && event.properties}
+							{#if expandedRow === event.id}
 								<tr class="bg-muted/30">
-									<td colspan="5" class="px-4 py-3">
-										<pre class="text-xs font-mono text-muted-foreground whitespace-pre-wrap">{JSON.stringify(event.properties, null, 2)}</pre>
+									<td colspan="5" class="px-4 py-3 space-y-2">
+										{#if event.source_file}
+											<div class="flex items-center gap-2">
+												<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">Source</span>
+												{#if event.source_url}
+													<a href={event.source_url} target="_blank" rel="noopener" class="text-xs text-primary font-mono hover:underline">{event.source_file}</a>
+												{:else}
+													<span class="text-xs text-muted-foreground font-mono">{event.source_file}</span>
+												{/if}
+											</div>
+										{/if}
+										{#if event.properties && Object.keys(event.properties).length > 0}
+											<pre class="text-xs font-mono text-muted-foreground whitespace-pre-wrap">{JSON.stringify(event.properties, null, 2)}</pre>
+										{/if}
 									</td>
 								</tr>
 							{/if}

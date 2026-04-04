@@ -2,6 +2,7 @@ package query
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -61,6 +62,14 @@ func (h *Handler) EventsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	nameCache, _ := h.meta.BatchGetEventNames(r.Context(), project.ID, fps)
+
+	// Build GitHub URL prefix if a connection exists.
+	var ghURLPrefix string
+	if conn, err := h.meta.GetGitHubConnection(r.Context(), project.ID); err == nil {
+		ghURLPrefix = fmt.Sprintf("https://github.com/%s/%s/blob/%s/",
+			conn.RepoOwner, conn.RepoName, conn.DefaultBranch)
+	}
+
 	for i := range events {
 		en, ok := nameCache[events[i].Fingerprint]
 		if !ok {
@@ -75,6 +84,9 @@ func (h *Handler) EventsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if en.SourceFile != nil && *en.SourceFile != "" {
 			events[i].SourceFile = *en.SourceFile
+			if ghURLPrefix != "" {
+				events[i].SourceURL = ghURLPrefix + *en.SourceFile
+			}
 		}
 	}
 
