@@ -994,6 +994,12 @@ func (s *Server) githubOAuthAuthorizeHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// In cloud mode, prefix state with slug and use control plane callback.
+	if s.config.CloudMode && s.config.ControlPlaneURL != "" {
+		slug := strings.Split(r.Host, ".")[0]
+		state = slug + "--" + state
+	}
+
 	authorizeURL := fmt.Sprintf(
 		"https://github.com/login/oauth/authorize?client_id=%s&state=%s&scope=repo",
 		url.QueryEscape(s.config.GitHubClientID),
