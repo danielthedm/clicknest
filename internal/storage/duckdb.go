@@ -493,13 +493,11 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
 		if step.EventName != "" {
+			nameLower := strings.ToLower(step.EventName)
 			if step.EventType == "pageview" {
-				sb.WriteString(" AND (LOWER(event_name) LIKE ? OR LOWER(url_path) LIKE ?)")
-				pattern := "%" + strings.ToLower(step.EventName) + "%"
-				args = append(args, pattern, pattern)
+				sb.WriteString(fmt.Sprintf(" AND (LOWER(COALESCE(event_name,'')) LIKE '%%%s%%' OR LOWER(url_path) LIKE '%%%s%%')", escapeLike(nameLower), escapeLike(nameLower)))
 			} else {
-				sb.WriteString(" AND LOWER(event_name) LIKE ?")
-				args = append(args, "%"+strings.ToLower(step.EventName)+"%")
+				sb.WriteString(fmt.Sprintf(" AND LOWER(COALESCE(event_name,'')) LIKE '%%%s%%'", escapeLike(nameLower)))
 			}
 		}
 		if !start.IsZero() {
@@ -667,13 +665,11 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
 		if step.EventName != "" {
+			nameLower := strings.ToLower(step.EventName)
 			if step.EventType == "pageview" {
-				sb.WriteString(" AND (LOWER(event_name) LIKE ? OR LOWER(url_path) LIKE ?)")
-				pattern := "%" + strings.ToLower(step.EventName) + "%"
-				args = append(args, pattern, pattern)
+				sb.WriteString(fmt.Sprintf(" AND (LOWER(COALESCE(event_name,'')) LIKE '%%%s%%' OR LOWER(url_path) LIKE '%%%s%%')", escapeLike(nameLower), escapeLike(nameLower)))
 			} else {
-				sb.WriteString(" AND LOWER(event_name) LIKE ?")
-				args = append(args, "%"+strings.ToLower(step.EventName)+"%")
+				sb.WriteString(fmt.Sprintf(" AND LOWER(COALESCE(event_name,'')) LIKE '%%%s%%'", escapeLike(nameLower)))
 			}
 		}
 		if !start.IsZero() {
@@ -1263,4 +1259,12 @@ func (d *DuckDB) MergeDistinctID(ctx context.Context, projectID, oldID, newID st
 
 func (d *DuckDB) Close() error {
 	return d.db.Close()
+}
+
+// escapeLike escapes special SQL LIKE characters in a string.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, "'", "''")
+	s = strings.ReplaceAll(s, "%", "\\%")
+	s = strings.ReplaceAll(s, "_", "\\_")
+	return s
 }
