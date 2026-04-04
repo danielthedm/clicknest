@@ -3,6 +3,7 @@
 	import { listAlerts, createAlert, updateAlert, deleteAlert } from '$lib/api';
 	import { relativeTime } from '$lib/utils';
 	import type { Alert } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let alerts = $state<Alert[]>([]);
 	let loading = $state(true);
@@ -15,6 +16,7 @@
 	let newEventName = $state('');
 	let newThreshold = $state(10);
 	let newWindowMinutes = $state(60);
+	let newWindowStr = $state('60');
 	let newWebhookURL = $state('');
 	let creating = $state(false);
 
@@ -43,7 +45,8 @@
 		creating = true;
 		error = '';
 		try {
-			await createAlert({
+			newWindowMinutes = parseInt(newWindowStr, 10) || 60;
+		await createAlert({
 				name: newName,
 				metric: newMetric,
 				event_name: newEventName || undefined,
@@ -57,6 +60,7 @@
 			newEventName = '';
 			newThreshold = 10;
 			newWindowMinutes = 60;
+			newWindowStr = '60';
 			newWebhookURL = '';
 			showForm = false;
 			await load();
@@ -119,12 +123,16 @@
 					<input bind:value={newName} placeholder="High error rate" class="w-full px-2 py-1.5 text-sm border border-border rounded bg-background" />
 				</div>
 				<div>
-					<label class="text-xs text-muted-foreground block mb-1">Metric</label>
-					<select bind:value={newMetric} class="w-full px-2 py-1.5 text-sm border border-border rounded bg-background">
-						<option value="error_count">Error count</option>
-						<option value="event_count">Event count</option>
-						<option value="pageview_count">Pageview count</option>
-					</select>
+					<Select
+						bind:value={newMetric}
+						options={[
+							{ value: 'error_count', label: 'Error count' },
+							{ value: 'event_count', label: 'Event count' },
+							{ value: 'pageview_count', label: 'Pageview count' },
+						]}
+						label="Metric"
+						size="sm"
+					/>
 				</div>
 				{#if newMetric === 'event_count'}
 					<div>
@@ -137,12 +145,12 @@
 					<input type="number" bind:value={newThreshold} min="0" class="w-full px-2 py-1.5 text-sm border border-border rounded bg-background" />
 				</div>
 				<div>
-					<label class="text-xs text-muted-foreground block mb-1">Window</label>
-					<select bind:value={newWindowMinutes} class="w-full px-2 py-1.5 text-sm border border-border rounded bg-background">
-						{#each windowOptions as opt}
-							<option value={opt.value}>{opt.label}</option>
-						{/each}
-					</select>
+					<Select
+						bind:value={newWindowStr}
+						options={windowOptions.map(opt => ({ value: String(opt.value), label: opt.label }))}
+						label="Window"
+						size="sm"
+					/>
 				</div>
 				<div class="col-span-2">
 					<label class="text-xs text-muted-foreground block mb-1">Webhook URL</label>

@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { listExperiments, createExperiment, deleteExperiment, listFlags, listConversionGoals } from '$lib/api';
 	import type { Experiment, FeatureFlag, ConversionGoal } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let experiments: Experiment[] = $state([]);
 	let flags: FeatureFlag[] = $state([]);
@@ -88,26 +89,30 @@
 					<input bind:value={form.name} placeholder="e.g. CTA Button Color Test" class="w-full px-3 py-2 rounded-md border border-input bg-background text-sm" />
 				</div>
 				<div>
-					<label class="block text-sm font-medium text-foreground mb-1">Feature Flag Key</label>
-					<select bind:value={form.flag_key} class="w-full px-3 py-2 rounded-md border border-input bg-background text-sm">
-						<option value="">Select a flag...</option>
-						{#each flags as flag}
-							<option value={flag.key}>{flag.name} ({flag.key})</option>
-						{/each}
-					</select>
+					<Select
+						bind:value={form.flag_key}
+						options={[
+							{ value: '', label: 'Select a flag...' },
+							...flags.map(flag => ({ value: flag.key, label: `${flag.name} (${flag.key})` })),
+						]}
+						label="Feature Flag Key"
+						size="md"
+					/>
 				</div>
 				<div>
 					<label class="block text-sm font-medium text-foreground mb-1">Variants (comma-separated)</label>
 					<input bind:value={form.variants} placeholder="control,variant_a,variant_b" class="w-full px-3 py-2 rounded-md border border-input bg-background text-sm" />
 				</div>
 				<div>
-					<label class="block text-sm font-medium text-foreground mb-1">Conversion Goal (optional)</label>
-					<select bind:value={form.conversion_goal_id} class="w-full px-3 py-2 rounded-md border border-input bg-background text-sm">
-						<option value="">None (use exposures only)</option>
-						{#each goals as goal}
-							<option value={goal.id}>{goal.name}</option>
-						{/each}
-					</select>
+					<Select
+						bind:value={form.conversion_goal_id}
+						options={[
+							{ value: '', label: 'None (use exposures only)' },
+							...goals.map(goal => ({ value: goal.id, label: goal.name })),
+						]}
+						label="Conversion Goal (optional)"
+						size="md"
+					/>
 				</div>
 			</div>
 			<label class="flex items-center gap-2 text-sm">

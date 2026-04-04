@@ -3,6 +3,7 @@
 	import { getLeads, listScoringRules, createScoringRule, updateScoringRule, deleteScoringRule, listCRMWebhooks, createCRMWebhook, updateCRMWebhook, deleteCRMWebhook, testCRMWebhook, listWebhookDeliveries, retryWebhookDelivery, getDeadLetters, getLeadAttribution, listSegments, createSegment, deleteSegment, getSegmentMembers } from '$lib/api';
 	import { formatTime, relativeTime } from '$lib/utils';
 	import type { ScoredLead, ScoringRule, CRMWebhook, WebhookDelivery, DeadLetter, LeadAttribution, Segment } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let leads = $state<ScoredLead[]>([]);
 	let total = $state(0);
@@ -309,11 +310,17 @@
 			<p class="text-sm text-muted-foreground">{total} identified users scored based on {rules.length} rule{rules.length !== 1 ? 's' : ''}</p>
 		</div>
 		<div class="flex items-center gap-2">
-			<select bind:value={range} onchange={() => loadAll()} class="text-sm border border-border rounded-md px-2 py-1 bg-background">
-				<option value="7d">Last 7 days</option>
-				<option value="30d">Last 30 days</option>
-				<option value="90d">Last 90 days</option>
-			</select>
+			<Select
+				bind:value={range}
+				onchange={() => loadAll()}
+				options={[
+					{ value: '7d', label: 'Last 7 days' },
+					{ value: '30d', label: 'Last 30 days' },
+					{ value: '90d', label: 'Last 90 days' },
+				]}
+				size="sm"
+				fullWidth={false}
+			/>
 		</div>
 	</div>
 
@@ -436,12 +443,12 @@
 						<input bind:value={ruleName} placeholder="e.g. Visited pricing" class="w-full mt-1 px-3 py-1.5 text-sm border border-border rounded-md bg-background" />
 					</div>
 					<div>
-						<label class="text-xs font-medium text-muted-foreground">Rule Type</label>
-						<select bind:value={ruleType} class="w-full mt-1 px-3 py-1.5 text-sm border border-border rounded-md bg-background">
-							{#each ruleTypes as rt}
-								<option value={rt.value}>{rt.label}</option>
-							{/each}
-						</select>
+						<Select
+							bind:value={ruleType}
+							options={ruleTypes}
+							label="Rule Type"
+							size="sm"
+						/>
 					</div>
 					<div>
 						<label class="text-xs font-medium text-muted-foreground">Points</label>
@@ -740,12 +747,13 @@
 
 					<div class="flex items-end gap-2 mt-2 flex-wrap">
 						<div>
-							<label class="text-xs text-muted-foreground">Type</label>
-							<select bind:value={segRuleType} class="mt-1 px-2 py-1.5 text-sm border border-border rounded-md bg-background">
-								{#each ruleTypes.filter(r => !['inactivity','recency_decay','negative'].includes(r.value)) as rt}
-									<option value={rt.value}>{rt.label}</option>
-								{/each}
-							</select>
+							<Select
+								bind:value={segRuleType}
+								options={ruleTypes.filter(r => !['inactivity','recency_decay','negative'].includes(r.value))}
+								label="Type"
+								size="sm"
+								fullWidth={false}
+							/>
 						</div>
 						{#if segRuleType === 'page_visit'}
 							<div><label class="text-xs text-muted-foreground">URL Path</label><input bind:value={segConfigURL} placeholder="/pricing" class="mt-1 w-40 px-2 py-1.5 text-sm border border-border rounded-md bg-background" /></div>

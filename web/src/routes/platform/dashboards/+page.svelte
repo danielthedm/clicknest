@@ -3,6 +3,7 @@
 	import { listDashboards, createDashboard, deleteDashboard } from '$lib/api';
 	import { relativeTime } from '$lib/utils';
 	import type { Dashboard } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let dashboards = $state<Dashboard[]>([]);
 	let loading = $state(true);
@@ -101,16 +102,18 @@
 				/>
 				<div class="flex gap-2 items-center">
 					<span class="text-xs text-muted-foreground">View type</span>
-					<select
+					<Select
 						bind:value={newView}
-						class="px-3 py-1.5 text-sm border border-border rounded-md bg-background"
-					>
-						<option value="events">Events</option>
-						<option value="trends">Trends</option>
-						<option value="funnels">Funnels</option>
-						<option value="sessions">Sessions</option>
-						<option value="retention">Retention</option>
-					</select>
+						options={[
+							{ value: 'events', label: 'Events' },
+							{ value: 'trends', label: 'Trends' },
+							{ value: 'funnels', label: 'Funnels' },
+							{ value: 'sessions', label: 'Sessions' },
+							{ value: 'retention', label: 'Retention' },
+						]}
+						size="sm"
+						fullWidth={false}
+					/>
 				</div>
 				<button
 					onclick={handleCreate}

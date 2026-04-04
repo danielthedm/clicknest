@@ -4,6 +4,7 @@
 	import type { TrendPoint, TrendSeries } from '$lib/types';
 	import Chart from '$lib/components/ui/Chart.svelte';
 	import { getCssColor, baseLineOptions, type ChartConfiguration } from '$lib/chart-config';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	const PALETTE = [
 		'hsl(217 91% 60%)', 'hsl(142 71% 45%)', 'hsl(263 70% 50%)',
@@ -173,16 +174,18 @@
 
 		<div class="flex items-center gap-2">
 			<span class="text-xs text-muted-foreground">Break down by</span>
-			<select
+			<Select
 				bind:value={breakdown}
 				onchange={() => loadTrends()}
-				class="px-2 py-1.5 text-sm border border-border rounded-md bg-background"
-			>
-				<option value="none">None</option>
-				<option value="event_name">Event name</option>
-				<option value="event_type">Event type</option>
-				<option value="url_path">URL path</option>
-			</select>
+				options={[
+					{ value: 'none', label: 'None' },
+					{ value: 'event_name', label: 'Event name' },
+					{ value: 'event_type', label: 'Event type' },
+					{ value: 'url_path', label: 'URL path' },
+				]}
+				size="sm"
+				fullWidth={false}
+			/>
 		</div>
 	</div>
 

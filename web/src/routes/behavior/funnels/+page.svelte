@@ -4,6 +4,7 @@
 	import type { Funnel, FunnelStep, FunnelResult, FunnelCohortResult, SuggestedFunnel, EventName } from '$lib/types';
 	import { relativeTime } from '$lib/utils';
 	import AiInsight from '$lib/components/ui/AiInsight.svelte';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let funnels = $state<Funnel[]>([]);
 	let selectedFunnel = $state<Funnel | null>(null);
@@ -323,16 +324,18 @@
 				{#each newSteps as step, i}
 					<div class="flex gap-2 items-center">
 						<span class="text-xs text-muted-foreground w-16">Step {i + 1}</span>
-						<select
+						<Select
 							bind:value={step.event_type}
-							class="px-3 py-1.5 text-sm border border-border rounded-md bg-background"
-						>
-							<option value="pageview">Pageview</option>
-							<option value="click">Click</option>
-							<option value="submit">Submit</option>
-							<option value="input">Input</option>
-							<option value="custom">Custom</option>
-						</select>
+							options={[
+								{ value: 'pageview', label: 'Pageview' },
+								{ value: 'click', label: 'Click' },
+								{ value: 'submit', label: 'Submit' },
+								{ value: 'input', label: 'Input' },
+								{ value: 'custom', label: 'Custom' },
+							]}
+							size="sm"
+							fullWidth={false}
+						/>
 						<input
 							bind:value={step.event_name}
 							list="known-event-names"

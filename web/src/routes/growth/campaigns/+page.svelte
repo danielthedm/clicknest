@@ -3,6 +3,7 @@
 	import { listCampaigns, generateCampaign, deleteCampaign, createABTest, getABResults, publishCampaign, listConnectors } from '$lib/api';
 	import { formatTime, relativeTime } from '$lib/utils';
 	import type { Campaign, CampaignContent, ABVariation, ConnectorInfo } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let campaigns = $state<Campaign[]>([]);
 	let campaignStats = $state<Record<string, { sessions: number; users: number; bounced: number; avg_pages: number }>>({});
@@ -149,12 +150,12 @@
 		<div class="border border-border rounded-lg p-4 space-y-3 bg-card">
 			<div class="grid grid-cols-2 gap-3">
 				<div>
-					<label class="text-xs font-medium text-muted-foreground">Channel</label>
-					<select bind:value={genChannel} class="w-full mt-1 px-3 py-1.5 text-sm border border-border rounded-md bg-background">
-						{#each channels as ch}
-							<option value={ch.value}>{ch.label}</option>
-						{/each}
-					</select>
+					<Select
+						bind:value={genChannel}
+						options={channels}
+						label="Channel"
+						size="sm"
+					/>
 				</div>
 				<div>
 					<label class="text-xs font-medium text-muted-foreground">Topic / Angle</label>
@@ -284,12 +285,12 @@
 		<div class="bg-background border border-border rounded-lg p-6 w-full max-w-sm space-y-4">
 			<h3 class="font-medium text-sm">Publish Campaign</h3>
 			<div>
-				<label class="text-xs font-medium text-muted-foreground">Publisher</label>
-				<select bind:value={publishPublisher} class="w-full mt-1 text-sm border border-border rounded-md px-3 py-1.5 bg-background">
-					{#each publishers as pub}
-						<option value={pub.name}>{pub.display_name}</option>
-					{/each}
-				</select>
+				<Select
+					bind:value={publishPublisher}
+					options={publishers.map(pub => ({ value: pub.name, label: pub.display_name }))}
+					label="Publisher"
+					size="sm"
+				/>
 			</div>
 			{#if publishError}
 				<p class="text-xs text-destructive">{publishError}</p>

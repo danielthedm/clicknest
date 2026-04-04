@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { getHeatmap, getPages } from '$lib/api';
 	import type { HeatmapPoint, PageStat } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let points = $state<HeatmapPoint[]>([]);
 	let pages = $state<PageStat[]>([]);
@@ -126,19 +127,14 @@
 	</div>
 
 	<div class="flex gap-3 mb-4">
-		<select
+		<Select
 			bind:value={selectedPath}
 			onchange={() => loadHeatmap()}
-			class="flex-1 px-3 py-1.5 text-sm border border-border rounded bg-background"
-		>
-			{#if pages.length === 0}
-				<option value="">No pages found</option>
-			{:else}
-				{#each pages as p}
-					<option value={p.path}>{p.path} ({p.views.toLocaleString()} views)</option>
-				{/each}
-			{/if}
-		</select>
+			options={pages.length === 0
+				? [{ value: '', label: 'No pages found' }]
+				: pages.map(p => ({ value: p.path, label: `${p.path} (${p.views.toLocaleString()} views)` }))}
+			size="sm"
+		/>
 		<button
 			onclick={() => loadHeatmap()}
 			class="px-3 py-1.5 text-sm rounded border border-border hover:bg-accent transition-colors"

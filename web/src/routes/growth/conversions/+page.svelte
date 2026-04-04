@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { listConversionGoals, createConversionGoal, deleteConversionGoal } from '$lib/api';
 	import type { ConversionGoal } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let goals: ConversionGoal[] = $state([]);
 	let loading = $state(true);
@@ -62,12 +63,12 @@
 					<input bind:value={form.name} placeholder="e.g. Purchase, Signup" class="w-full px-3 py-2 rounded-md border border-input bg-background text-sm" />
 				</div>
 				<div>
-					<label class="block text-sm font-medium text-foreground mb-1">Event Type</label>
-					<select bind:value={form.event_type} class="w-full px-3 py-2 rounded-md border border-input bg-background text-sm">
-						{#each presetTypes as t}
-							<option value={t.value}>{t.label}</option>
-						{/each}
-					</select>
+					<Select
+						bind:value={form.event_type}
+						options={presetTypes}
+						label="Event Type"
+						size="md"
+					/>
 				</div>
 				<div>
 					<label class="block text-sm font-medium text-foreground mb-1">Event Name (optional)</label>

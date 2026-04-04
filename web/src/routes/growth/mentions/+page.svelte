@@ -10,6 +10,7 @@
 	} from '$lib/api';
 	import { relativeTime } from '$lib/utils';
 	import type { MentionRecord, SourceInfo, ConnectorInfo } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let mentions = $state<MentionRecord[]>([]);
 	let total = $state(0);
@@ -142,29 +143,31 @@
 
 	<!-- Filters -->
 	<div class="flex gap-3 items-center">
-		<select
+		<Select
 			bind:value={filterStatus}
 			onchange={() => loadAll()}
-			class="text-sm border border-border rounded-md px-2 py-1.5 bg-background"
-		>
-			<option value="">All statuses</option>
-			<option value="new">New</option>
-			<option value="reviewed">Reviewed</option>
-			<option value="replied">Replied</option>
-			<option value="dismissed">Dismissed</option>
-			<option value="lead">Lead</option>
-		</select>
+			options={[
+				{ value: '', label: 'All statuses' },
+				{ value: 'new', label: 'New' },
+				{ value: 'reviewed', label: 'Reviewed' },
+				{ value: 'replied', label: 'Replied' },
+				{ value: 'dismissed', label: 'Dismissed' },
+				{ value: 'lead', label: 'Lead' },
+			]}
+			size="sm"
+			fullWidth={false}
+		/>
 
-		<select
+		<Select
 			bind:value={filterSource}
 			onchange={() => loadAll()}
-			class="text-sm border border-border rounded-md px-2 py-1.5 bg-background"
-		>
-			<option value="">All sources</option>
-			{#each sources as src}
-				<option value={src.name}>{src.display_name}</option>
-			{/each}
-		</select>
+			options={[
+				{ value: '', label: 'All sources' },
+				...sources.map(src => ({ value: src.name, label: src.display_name })),
+			]}
+			size="sm"
+			fullWidth={false}
+		/>
 
 		<span class="text-sm text-muted-foreground ml-auto">{total} mentions</span>
 	</div>
@@ -244,14 +247,12 @@
 									</button>
 
 									{#if publishers.length > 0}
-										<select
+										<Select
 											bind:value={selectedPublisher}
-											class="text-sm border border-border rounded-md px-2 py-1.5 bg-background"
-										>
-											{#each publishers as pub}
-												<option value={pub.name}>{pub.display_name}</option>
-											{/each}
-										</select>
+											options={publishers.map(pub => ({ value: pub.name, label: pub.display_name }))}
+											size="sm"
+											fullWidth={false}
+										/>
 									{/if}
 								</div>
 

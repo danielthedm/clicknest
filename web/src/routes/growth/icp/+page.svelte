@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { getPages, analyzeICP, listICPAnalyses, deleteICPAnalysis, icpGenerateCampaign, icpCreateScoringRules, getICPSettings, putICPSettings } from '$lib/api';
 	import type { PageStat, ICPAnalysis, ICPUserProfile, SavedICPAnalysis } from '$lib/types';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let activeTab = $state<'analyze' | 'history'>('analyze');
 	let pages = $state<PageStat[]>([]);
@@ -467,14 +468,12 @@
 
 								<div class="flex items-center justify-between pt-2 border-t border-border">
 									<div class="flex items-center gap-2">
-										<select
+										<Select
 											bind:value={icpActionChannel}
-											class="text-xs border border-border rounded px-2 py-1 bg-background"
-										>
-											{#each icpChannels as ch}
-												<option value={ch}>{ch}</option>
-											{/each}
-										</select>
+											options={icpChannels.map(ch => ({ value: ch, label: ch }))}
+											size="sm"
+											fullWidth={false}
+										/>
 										<button
 											onclick={() => handleGenerateCampaign(sa.id)}
 											disabled={icpActionId === sa.id}

@@ -6,6 +6,7 @@
 	import type { Event, EventNameStat } from '$lib/types';
 	import Chart from '$lib/components/ui/Chart.svelte';
 	import { EVENT_TYPE_COLORS, type ChartConfiguration } from '$lib/chart-config';
+	import Select from '$lib/components/ui/Select.svelte';
 
 	let activeTab = $state<'stream' | 'stats'>('stream');
 
@@ -278,40 +279,42 @@
 
 		<!-- Filters + Save View -->
 		<div class="flex gap-2 mb-4 flex-wrap items-center">
-			<select
+			<Select
 				bind:value={filter.event_type}
 				onchange={loadEvents}
-				class="px-3 py-1.5 text-sm border border-border rounded-md bg-background"
-			>
-				<option value="">All types</option>
-				<option value="click">Click</option>
-				<option value="pageview">Pageview</option>
-				<option value="submit">Submit</option>
-				<option value="input">Input</option>
-				<option value="custom">Custom</option>
-			</select>
+				options={[
+					{ value: '', label: 'All types' },
+					{ value: 'click', label: 'Click' },
+					{ value: 'pageview', label: 'Pageview' },
+					{ value: 'submit', label: 'Submit' },
+					{ value: 'input', label: 'Input' },
+					{ value: 'custom', label: 'Custom' },
+				]}
+				size="sm"
+				fullWidth={false}
+			/>
 			{#if propertyKeys.length > 0}
-				<select
+				<Select
 					bind:value={filter.property_key}
 					onchange={onPropertyKeyChange}
-					class="px-3 py-1.5 text-sm border border-border rounded-md bg-background"
-				>
-					<option value="">All properties</option>
-					{#each propertyKeys as key}
-						<option value={key}>{key}</option>
-					{/each}
-				</select>
+					options={[
+						{ value: '', label: 'All properties' },
+						...propertyKeys.map(key => ({ value: key, label: key })),
+					]}
+					size="sm"
+					fullWidth={false}
+				/>
 				{#if filter.property_key && propertyValues.length > 0}
-					<select
+					<Select
 						bind:value={filter.property_value}
 						onchange={loadEvents}
-						class="px-3 py-1.5 text-sm border border-border rounded-md bg-background"
-					>
-						<option value="">All values</option>
-						{#each propertyValues as val}
-							<option value={val}>{val}</option>
-						{/each}
-					</select>
+						options={[
+							{ value: '', label: 'All values' },
+							...propertyValues.map(val => ({ value: val, label: val })),
+						]}
+						size="sm"
+						fullWidth={false}
+					/>
 				{/if}
 			{/if}
 
