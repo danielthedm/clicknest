@@ -78,19 +78,19 @@ func buildSuggestPrompt(sequences []storage.EventSequence, productDesc string, n
 		b.WriteString("\n")
 	}
 
-	// Show named events so the AI can reference them.
+	// Show named events (capped to avoid blowing up context).
 	if len(namedEvents) > 0 {
 		b.WriteString("NAMED EVENTS (AI-identified user interactions):\n")
-		for _, en := range namedEvents {
+		cap := 30
+		if len(namedEvents) < cap {
+			cap = len(namedEvents)
+		}
+		for _, en := range namedEvents[:cap] {
 			name := en.AIName
 			if en.UserName != nil && *en.UserName != "" {
 				name = *en.UserName
 			}
-			sf := ""
-			if en.SourceFile != nil && *en.SourceFile != "" {
-				sf = " [" + *en.SourceFile + "]"
-			}
-			fmt.Fprintf(&b, "  - %s (fingerprint: %s)%s\n", name, en.Fingerprint, sf)
+			fmt.Fprintf(&b, "  - %s\n", name)
 		}
 		b.WriteString("\n")
 	}
@@ -152,7 +152,7 @@ func openaiChat(ctx context.Context, cfg *storage.LLMConfig, systemMsg, userMsg 
 			{"role": "user", "content": userMsg},
 		},
 		"temperature": 0.3,
-		"max_tokens":  800,
+		"max_tokens":  2000,
 	}
 
 	jsonBody, _ := json.Marshal(body)
@@ -208,7 +208,7 @@ func anthropicChat(ctx context.Context, cfg *storage.LLMConfig, systemMsg, userM
 
 	body := map[string]any{
 		"model":      model,
-		"max_tokens": 800,
+		"max_tokens": 2000,
 		"system":     systemMsg,
 		"messages": []map[string]string{
 			{"role": "user", "content": userMsg},
