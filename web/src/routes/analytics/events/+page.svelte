@@ -368,8 +368,8 @@
 						{#each groupedEvents() as group}
 							{@const event = group.event}
 							<tr
-								class="hover:bg-accent/50 transition-colors {event.properties && Object.keys(event.properties).length > 0 ? 'cursor-pointer' : ''}"
-								onclick={() => { if (event.properties && Object.keys(event.properties).length > 0) expandedRow = expandedRow === event.id ? null : event.id; }}
+								class="hover:bg-accent/50 transition-colors cursor-pointer"
+								onclick={() => { expandedRow = expandedRow === event.id ? null : event.id; }}
 							>
 								<td class="px-4 py-2.5">
 									<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium uppercase tracking-wider
@@ -398,26 +398,77 @@
 								</td>
 								<td class="px-4 py-2.5 text-xs text-muted-foreground whitespace-nowrap" title={formatTime(event.timestamp)}>
 									{relativeTime(event.timestamp)}
-									{#if event.properties && Object.keys(event.properties).length > 0}
-										<span class="ml-1 text-primary">{expandedRow === event.id ? '▾' : '▸'}</span>
-									{/if}
+									<span class="ml-1 text-primary">{expandedRow === event.id ? '▾' : '▸'}</span>
 								</td>
 							</tr>
 							{#if expandedRow === event.id}
 								<tr class="bg-muted/30">
-									<td colspan="5" class="px-4 py-3 space-y-2">
-										{#if event.source_file}
-											<div class="flex items-center gap-2">
-												<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">Source</span>
-												{#if event.source_url}
-													<a href={event.source_url} target="_blank" rel="noopener" class="text-xs text-primary font-mono hover:underline">{event.source_file}</a>
-												{:else}
-													<span class="text-xs text-muted-foreground font-mono">{event.source_file}</span>
-												{/if}
+									<td colspan="5" class="px-4 py-3">
+										<div class="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-2 text-xs mb-3">
+											{#if event.distinct_id}
+												<div>
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">User</span>
+													<span class="font-mono">{event.distinct_id}</span>
+												</div>
+											{/if}
+											<div>
+												<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Session</span>
+												<a href="/sessions?id={event.session_id}" class="text-primary hover:underline font-mono">{event.session_id.substring(0, 12)}</a>
 											</div>
-										{/if}
+											<div>
+												<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Page</span>
+												<span class="font-mono">{event.url_path}</span>
+											</div>
+											<div>
+												<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Time</span>
+												<span>{formatTime(event.timestamp)}</span>
+											</div>
+											{#if event.element_tag}
+												<div>
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Element</span>
+													<span class="font-mono">&lt;{event.element_tag}&gt;{#if event.element_id} #{event.element_id}{/if}</span>
+												</div>
+											{/if}
+											{#if event.element_text}
+												<div>
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Text</span>
+													<span class="truncate block max-w-[200px]">{event.element_text}</span>
+												</div>
+											{/if}
+											{#if event.element_classes}
+												<div class="col-span-2">
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Classes</span>
+													<span class="font-mono text-muted-foreground truncate block">{event.element_classes}</span>
+												</div>
+											{/if}
+											{#if event.referrer}
+												<div>
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Referrer</span>
+													<span class="font-mono truncate block max-w-[200px]">{event.referrer}</span>
+												</div>
+											{/if}
+											{#if event.screen_width && event.screen_height}
+												<div>
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Screen</span>
+													<span>{event.screen_width} x {event.screen_height}</span>
+												</div>
+											{/if}
+											{#if event.source_file}
+												<div class="col-span-2">
+													<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block">Source</span>
+													{#if event.source_url}
+														<a href={event.source_url} target="_blank" rel="noopener" class="text-primary font-mono hover:underline">{event.source_file}</a>
+													{:else}
+														<span class="font-mono text-muted-foreground">{event.source_file}</span>
+													{/if}
+												</div>
+											{/if}
+										</div>
 										{#if event.properties && Object.keys(event.properties).length > 0}
-											<pre class="text-xs font-mono text-muted-foreground whitespace-pre-wrap">{JSON.stringify(event.properties, null, 2)}</pre>
+											<div>
+												<span class="text-[10px] uppercase tracking-wider text-muted-foreground font-medium block mb-1">Properties</span>
+												<pre class="text-xs font-mono text-muted-foreground whitespace-pre-wrap bg-background rounded p-2 border border-border">{JSON.stringify(event.properties, null, 2)}</pre>
+											</div>
 										{/if}
 									</td>
 								</tr>
