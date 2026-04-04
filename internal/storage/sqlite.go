@@ -197,6 +197,16 @@ func (s *SQLite) SetEventName(ctx context.Context, en EventName) error {
 	return err
 }
 
+// ClearAIEventNames deletes all AI-generated names (preserving user overrides)
+// for a project so they can be regenerated with new context.
+func (s *SQLite) ClearAIEventNames(ctx context.Context, projectID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM event_names WHERE project_id = ? AND (user_name IS NULL OR user_name = '')`,
+		projectID,
+	)
+	return err
+}
+
 // OverrideEventName sets a user-provided name that takes priority over the AI name.
 func (s *SQLite) OverrideEventName(ctx context.Context, projectID, fingerprint, userName string) error {
 	_, err := s.db.ExecContext(ctx,

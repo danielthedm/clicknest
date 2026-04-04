@@ -310,6 +310,35 @@ func (d *DuckDB) UnnamedFingerprints(ctx context.Context, projectID string) ([]E
 	return events, rows.Err()
 }
 
+// AllFingerprints returns one representative event per fingerprint (non-pageview).
+// Used to re-run naming with source code enrichment.
+func (d *DuckDB) AllFingerprints(ctx context.Context, projectID string) ([]Event, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT fingerprint, element_tag, element_id, element_classes, element_text,
+		       aria_label, parent_path, url, url_path, page_title
+		FROM events
+		WHERE project_id = ? AND event_type != 'pageview'
+		GROUP BY fingerprint, element_tag, element_id, element_classes, element_text,
+		         aria_label, parent_path, url, url_path, page_title
+	`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("querying all fingerprints: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.Fingerprint, &e.ElementTag, &e.ElementID, &e.ElementClasses,
+			&e.ElementText, &e.AriaLabel, &e.ParentPath, &e.URL, &e.URLPath, &e.PageTitle); err != nil {
+			return nil, fmt.Errorf("scanning fingerprint: %w", err)
+		}
+		e.ProjectID = projectID
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
 type UserProfile struct {
 	DistinctID string    `json:"distinct_id"`
 	EventCount int       `json:"event_count"`

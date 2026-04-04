@@ -660,6 +660,10 @@ export async function publishMentionReply(
 	await request(`/mentions/${id}/reply`, { method: 'POST', body: JSON.stringify(data) });
 }
 
+export async function reanalyzeEvents(): Promise<{ status: string }> {
+	return request('/events/reanalyze', { method: 'POST' });
+}
+
 // --- Sources ---
 
 export async function listSources(): Promise<{ sources: import('./types').SourceInfo[] }> {

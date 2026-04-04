@@ -212,6 +212,7 @@ func (s *Server) routes() {
 	s.mux.Handle("PUT /api/v1/project/description", sessionAuth(http.HandlerFunc(s.updateProjectDescriptionHandler)))
 	s.mux.Handle("GET /api/v1/llm/config", sessionAuth(http.HandlerFunc(s.getLLMConfigHandler)))
 	s.mux.Handle("PUT /api/v1/llm/config", sessionAuth(http.HandlerFunc(s.llmConfigHandler)))
+	s.mux.Handle("POST /api/v1/events/reanalyze", sessionAuth(http.HandlerFunc(s.reanalyzeEventsHandler)))
 
 	// GitHub integration.
 	s.mux.Handle("GET /api/v1/github", sessionAuth(http.HandlerFunc(s.githubGetHandler)))
@@ -723,6 +724,19 @@ func (s *Server) llmConfigHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) reanalyzeEventsHandler(w http.ResponseWriter, r *http.Request) {
+	project := auth.ProjectFromContext(r.Context())
+	if project == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	go s.namer.BackfillAll(r.Context(), project.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "reanalyzing"})
 }
 
 func (s *Server) suggestFunnelsHandler(w http.ResponseWriter, r *http.Request) {

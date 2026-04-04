@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getEvents, liveEvents, getPropertyKeys, getPropertyValues, createDashboard, getEventStats } from '$lib/api';
+	import { getEvents, liveEvents, getPropertyKeys, getPropertyValues, createDashboard, getEventStats, reanalyzeEvents } from '$lib/api';
 	import { eventDisplayName, relativeTime, formatTime } from '$lib/utils';
 	import { exportCSV } from '$lib/csv';
 	import type { Event, EventNameStat } from '$lib/types';
@@ -216,6 +216,10 @@
 		</div>
 		<div class="flex gap-2">
 			{#if activeTab === 'stream'}
+				<button
+					onclick={async () => { await reanalyzeEvents(); alert('Re-analyzing events with source code context. Names will update shortly.'); }}
+					class="px-3 py-1.5 text-sm rounded-md border border-border hover:bg-accent transition-colors"
+				>Re-analyze Names</button>
 				<button
 					onclick={() => exportCSV(events as any, 'events.csv')}
 					disabled={events.length === 0}

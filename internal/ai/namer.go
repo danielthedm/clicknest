@@ -131,6 +131,57 @@ func (n *Namer) Backfill(ctx context.Context, projectID string) {
 	}
 }
 
+// BackfillAll clears the naming cache (preserving user overrides) and re-queues
+// all fingerprints for naming with source code enrichment.
+func (n *Namer) BackfillAll(ctx context.Context, projectID string) {
+	n.mu.RLock()
+	noProvider := n.provider == nil
+	n.mu.RUnlock()
+	if noProvider {
+		return
+	}
+
+	// Clear existing AI names so the worker doesn't skip them.
+	if err := n.cache.meta.ClearAIEventNames(ctx, projectID); err != nil {
+		log.Printf("WARN backfill-all: clear names: %v", err)
+		return
+	}
+
+	events, err := n.events.AllFingerprints(ctx, projectID)
+	if err != nil {
+		log.Printf("WARN backfill-all query: %v", err)
+		return
+	}
+
+	queued := 0
+	for _, e := range events {
+		select {
+		case n.jobs <- NamingJob{
+			ProjectID:   e.ProjectID,
+			Fingerprint: e.Fingerprint,
+			Request: NamingRequest{
+				ElementTag:     e.ElementTag,
+				ElementID:      e.ElementID,
+				ElementClasses: e.ElementClasses,
+				ElementText:    e.ElementText,
+				AriaLabel:      e.AriaLabel,
+				ParentPath:     e.ParentPath,
+				URL:            e.URL,
+				URLPath:        e.URLPath,
+				PageTitle:      e.PageTitle,
+			},
+		}:
+			queued++
+		default:
+			log.Printf("WARN backfill-all queue full, queued %d/%d", queued, len(events))
+			return
+		}
+	}
+	if queued > 0 {
+		log.Printf("BackfillAll: queued %d fingerprints for re-naming with source context", queued)
+	}
+}
+
 // Close shuts down the naming workers.
 func (n *Namer) Close() {
 	close(n.jobs)
