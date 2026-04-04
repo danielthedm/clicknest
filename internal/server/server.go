@@ -786,7 +786,28 @@ func (s *Server) suggestFunnelsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	suggestions, err := ai.SuggestFunnels(r.Context(), cfg, sequences)
+	// Enrich with product context for better suggestions.
+	proj, _ := s.meta.GetProject(r.Context(), project.ID)
+	productDesc := ""
+	if proj != nil {
+		productDesc = proj.Description
+	}
+
+	namedEvents, _ := s.meta.ListEventNames(r.Context(), project.ID)
+
+	var sourceFiles []string
+	if rows, err := s.meta.DB().QueryContext(r.Context(),
+		`SELECT file_path FROM source_index WHERE project_id = ? ORDER BY file_path`, project.ID); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var fp string
+			if rows.Scan(&fp) == nil {
+				sourceFiles = append(sourceFiles, fp)
+			}
+		}
+	}
+
+	suggestions, err := ai.SuggestFunnels(r.Context(), cfg, sequences, productDesc, namedEvents, sourceFiles)
 	if err != nil {
 		log.Printf("ERROR suggesting funnels: %v", err)
 		http.Error(w, `{"error":"AI suggestion failed"}`, http.StatusInternalServerError)

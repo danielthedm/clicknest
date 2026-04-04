@@ -19,22 +19,26 @@ type SuggestedFunnel struct {
 	Steps       []storage.FunnelStep `json:"steps"`
 }
 
-// SuggestFunnels asks an LLM to propose funnel definitions based on observed event sequences.
-func SuggestFunnels(ctx context.Context, cfg *storage.LLMConfig, sequences []storage.EventSequence) ([]SuggestedFunnel, error) {
-	systemMsg := `You are an analytics funnel design assistant. Given a list of common event sequences observed in user sessions, suggest 2-4 meaningful conversion funnels.
+// SuggestFunnels asks an LLM to propose funnel definitions based on observed event sequences,
+// product context, named events, and source code structure.
+func SuggestFunnels(ctx context.Context, cfg *storage.LLMConfig, sequences []storage.EventSequence, productDesc string, namedEvents []storage.EventName, sourceFiles []string) ([]SuggestedFunnel, error) {
+	systemMsg := `You are a senior product analytics consultant. Given event data, product context, and source code structure, design conversion funnels that measure meaningful business outcomes.
 
 Return ONLY valid JSON in this format:
-{"suggestions": [{"name": "Funnel Name", "description": "What this funnel measures", "steps": [{"event_type": "pageview", "event_name": "optional name"}, ...]}]}
+{"suggestions": [{"name": "Funnel Name", "description": "What this funnel measures and why it matters", "steps": [{"event_type": "pageview", "event_name": "optional name"}, ...]}]}
 
 Rules:
-- Each funnel must have 2-5 steps
-- Focus on sequences that represent meaningful user journeys (signup, purchase, onboarding, etc.)
-- Use descriptive funnel names
-- The description should explain what conversion this funnel tracks
+- Suggest 3-5 funnels ranging from basic to advanced
+- Each funnel must have 3-6 steps
+- Focus on BUSINESS-CRITICAL journeys: onboarding completion, feature adoption, upgrade paths, aha moments
+- Use the named events and source code routes to understand what the app actually does
 - event_type must be one of: pageview, click, submit, input, custom
-- event_name can be empty string if the sequence only uses event_type`
+- event_name should use the AI-named event names when available
+- Include at least one funnel that measures the product's core value delivery
+- Include at least one funnel that measures activation (new user → first value moment)
+- Descriptions should explain WHY this funnel matters for the business, not just what it tracks`
 
-	userMsg := buildSuggestPrompt(sequences)
+	userMsg := buildSuggestPrompt(sequences, productDesc, namedEvents, sourceFiles)
 
 	raw, err := chatComplete(ctx, cfg, systemMsg, userMsg)
 	if err != nil {
@@ -53,21 +57,58 @@ Rules:
 	return result.Suggestions, nil
 }
 
-func buildSuggestPrompt(sequences []storage.EventSequence) string {
+func buildSuggestPrompt(sequences []storage.EventSequence, productDesc string, namedEvents []storage.EventName, sourceFiles []string) string {
 	var b strings.Builder
-	b.WriteString("Here are the most common event sequences observed in user sessions:\n\n")
+
+	if productDesc != "" {
+		b.WriteString("PRODUCT DESCRIPTION:\n")
+		b.WriteString(productDesc)
+		b.WriteString("\n\n")
+	}
+
+	// Show route structure so the AI understands the app's pages/features.
+	if len(sourceFiles) > 0 {
+		b.WriteString("APP ROUTES & SOURCE FILES (shows the product's feature structure):\n")
+		for _, f := range sourceFiles {
+			// Only show route files, not every source file.
+			if strings.Contains(f, "routes/") || strings.Contains(f, "pages/") || strings.Contains(f, "app/") {
+				b.WriteString("  " + f + "\n")
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	// Show named events so the AI can reference them.
+	if len(namedEvents) > 0 {
+		b.WriteString("NAMED EVENTS (AI-identified user interactions):\n")
+		for _, en := range namedEvents {
+			name := en.AIName
+			if en.UserName != nil && *en.UserName != "" {
+				name = *en.UserName
+			}
+			sf := ""
+			if en.SourceFile != nil && *en.SourceFile != "" {
+				sf = " [" + *en.SourceFile + "]"
+			}
+			fmt.Fprintf(&b, "  - %s (fingerprint: %s)%s\n", name, en.Fingerprint, sf)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("OBSERVED EVENT SEQUENCES (most common user journeys):\n\n")
 	for i, seq := range sequences {
 		var parts []string
 		for _, step := range seq.Steps {
 			label := step.EventType
 			if step.EventName != "" {
-				label += ":" + step.EventName
+				label += ": " + step.EventName
 			}
 			parts = append(parts, label)
 		}
 		fmt.Fprintf(&b, "%d. %s (seen in %d sessions)\n", i+1, strings.Join(parts, " → "), seq.SessionCount)
 	}
-	b.WriteString("\nSuggest 2-4 meaningful conversion funnels based on these patterns.")
+
+	b.WriteString("\nDesign 3-5 conversion funnels that measure meaningful business outcomes for this product.")
 	return b.String()
 }
 
