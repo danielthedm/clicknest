@@ -178,7 +178,7 @@ func openaiChat(ctx context.Context, cfg *storage.LLMConfig, systemMsg, userMsg 
 			{"role": "user", "content": userMsg},
 		},
 		"temperature": 0.3,
-		"max_tokens":  2000,
+		"max_tokens":  4096,
 	}
 
 	jsonBody, _ := json.Marshal(body)
