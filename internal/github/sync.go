@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"log"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -30,12 +31,13 @@ var (
 
 // Syncer handles background repo syncing and indexing.
 type Syncer struct {
-	meta *storage.SQLite
+	meta    *storage.SQLite
+	dataDir string
 }
 
 // NewSyncer creates a new repo syncer.
-func NewSyncer(meta *storage.SQLite) *Syncer {
-	return &Syncer{meta: meta}
+func NewSyncer(meta *storage.SQLite, dataDir string) *Syncer {
+	return &Syncer{meta: meta, dataDir: dataDir}
 }
 
 // SyncRepo syncs a GitHub repo and indexes component files.
@@ -78,6 +80,16 @@ func (s *Syncer) syncDirectory(ctx context.Context, client *Client, conn *storag
 		if err != nil {
 			log.Printf("WARN fetching %s: %v", entry.Path, err)
 			continue
+		}
+
+		// Save file content to disk for code agent search.
+		if s.dataDir != "" {
+			diskPath := filepath.Join(s.dataDir, "repos", conn.RepoOwner, conn.RepoName, entry.Path)
+			if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
+				log.Printf("WARN creating dir for %s: %v", entry.Path, err)
+			} else if err := os.WriteFile(diskPath, []byte(content), 0644); err != nil {
+				log.Printf("WARN writing %s: %v", diskPath, err)
+			}
 		}
 
 		selectors := extractSelectors(content)

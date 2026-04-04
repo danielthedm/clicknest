@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/danielthedm/clicknest/internal/storage"
@@ -21,7 +23,26 @@ type SuggestedFunnel struct {
 
 // SuggestFunnels asks an LLM to propose funnel definitions based on observed event sequences,
 // product context, named events, and source code structure.
-func SuggestFunnels(ctx context.Context, cfg *storage.LLMConfig, sequences []storage.EventSequence, productDesc string, namedEvents []storage.EventName, sourceFiles []string) ([]SuggestedFunnel, error) {
+// If repoDir is non-empty and points to a synced repo on disk with an Anthropic provider,
+// a CodeAgent is used to gather deeper codebase context first.
+func SuggestFunnels(ctx context.Context, cfg *storage.LLMConfig, sequences []storage.EventSequence, productDesc string, namedEvents []storage.EventName, sourceFiles []string, repoDir string) ([]SuggestedFunnel, error) {
+	// If we have a local repo and an Anthropic provider, use the CodeAgent
+	// to gather richer codebase context before suggesting funnels.
+	var codeContext string
+	if repoDir != "" && cfg.Provider == "anthropic" {
+		if _, err := os.Stat(repoDir); err == nil {
+			agent := NewCodeAgent(repoDir, cfg)
+			agentTask := "Analyze this codebase and identify the key user journeys, pages, features, and conversion points. List the most important user flows."
+			agentSystem := "You are a code analyst. Explore the codebase using the search and read tools to understand the application's structure, pages, features, and user flows. Be thorough but concise in your final summary."
+			result, err := agent.Run(ctx, agentSystem, agentTask)
+			if err != nil {
+				log.Printf("WARN code agent failed: %v", err)
+			} else {
+				codeContext = result
+			}
+		}
+	}
+
 	systemMsg := `You are a senior product analytics consultant. Given event data, product context, and source code structure, design conversion funnels that measure meaningful business outcomes.
 
 Return ONLY valid JSON in this format:
@@ -39,6 +60,11 @@ Rules:
 - Descriptions should explain WHY this funnel matters for the business, not just what it tracks`
 
 	userMsg := buildSuggestPrompt(sequences, productDesc, namedEvents, sourceFiles)
+
+	// Append code agent context if available.
+	if codeContext != "" {
+		userMsg += "\n\nDEEP CODEBASE ANALYSIS (from automated code review):\n" + codeContext
+	}
 
 	raw, err := chatComplete(ctx, cfg, systemMsg, userMsg)
 	if err != nil {

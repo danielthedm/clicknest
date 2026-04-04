@@ -807,7 +807,16 @@ func (s *Server) suggestFunnelsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	suggestions, err := ai.SuggestFunnels(r.Context(), cfg, sequences, productDesc, namedEvents, sourceFiles)
+	// Build repoDir path if a GitHub connection exists.
+	var repoDir string
+	if conn, err := s.meta.GetGitHubConnection(r.Context(), project.ID); err == nil {
+		candidate := filepath.Join(s.config.DataDir, "repos", conn.RepoOwner, conn.RepoName)
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			repoDir = candidate
+		}
+	}
+
+	suggestions, err := ai.SuggestFunnels(r.Context(), cfg, sequences, productDesc, namedEvents, sourceFiles, repoDir)
 	if err != nil {
 		log.Printf("ERROR suggesting funnels: %v", err)
 		http.Error(w, `{"error":"AI suggestion failed"}`, http.StatusInternalServerError)

@@ -144,7 +144,7 @@ func Setup(cfg Config) *App {
 	}
 
 	// Initialize GitHub integration.
-	syncer := ghub.NewSyncer(meta)
+	syncer := ghub.NewSyncer(meta, cfg.DataDir)
 	matcher := ghub.NewMatcher(meta)
 	if project != nil {
 		if _, err := meta.GetGitHubConnection(context.Background(), project.ID); err == nil {
