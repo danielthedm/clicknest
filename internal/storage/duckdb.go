@@ -493,8 +493,14 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
 		if step.EventName != "" {
-			sb.WriteString(" AND event_name = ?")
-			args = append(args, step.EventName)
+			if step.EventType == "pageview" {
+				sb.WriteString(" AND (LOWER(event_name) LIKE ? OR LOWER(url_path) LIKE ?)")
+				pattern := "%" + strings.ToLower(step.EventName) + "%"
+				args = append(args, pattern, pattern)
+			} else {
+				sb.WriteString(" AND LOWER(event_name) LIKE ?")
+				args = append(args, "%"+strings.ToLower(step.EventName)+"%")
+			}
 		}
 		if !start.IsZero() {
 			sb.WriteString(" AND timestamp >= ?")
@@ -661,8 +667,14 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
 		if step.EventName != "" {
-			sb.WriteString(" AND event_name = ?")
-			args = append(args, step.EventName)
+			if step.EventType == "pageview" {
+				sb.WriteString(" AND (LOWER(event_name) LIKE ? OR LOWER(url_path) LIKE ?)")
+				pattern := "%" + strings.ToLower(step.EventName) + "%"
+				args = append(args, pattern, pattern)
+			} else {
+				sb.WriteString(" AND LOWER(event_name) LIKE ?")
+				args = append(args, "%"+strings.ToLower(step.EventName)+"%")
+			}
 		}
 		if !start.IsZero() {
 			sb.WriteString(" AND timestamp >= ?")

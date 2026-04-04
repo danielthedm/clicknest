@@ -468,26 +468,43 @@
 				{:else if results.length === 0}
 					<div class="p-8 text-center text-muted-foreground text-sm">No results for this period</div>
 				{:else}
-					<div class="p-4 space-y-3">
+					<div class="p-4 space-y-4">
 						{#each results as result, i}
 							{@const maxCount = results[0].count || 1}
 							{@const pct = Math.round((result.count / maxCount) * 100)}
+							{@const prevCount = i > 0 ? results[i - 1].count : result.count}
+							{@const dropoff = i > 0 && prevCount > 0 ? prevCount - result.count : 0}
+							{@const dropoffPct = i > 0 && prevCount > 0 ? Math.round((dropoff / prevCount) * 100) : 0}
 							<div>
-								<div class="flex items-center justify-between mb-1">
-									<span class="text-sm">{result.step}</span>
-									<span class="text-sm text-muted-foreground">{result.count.toLocaleString()} {i > 0 ? `(${conversionRate(i)} from prev)` : ''}</span>
+								<div class="flex items-center justify-between mb-1.5">
+									<span class="text-sm font-medium">{result.step}</span>
+									<div class="flex items-center gap-3 text-sm">
+										<span class="font-mono">{result.count.toLocaleString()}</span>
+										{#if i > 0}
+											<span class="text-muted-foreground">{conversionRate(i)}</span>
+											{#if dropoff > 0}
+												<span class="text-red-500 text-xs">-{dropoff.toLocaleString()} ({dropoffPct}% drop)</span>
+											{/if}
+										{/if}
+									</div>
 								</div>
-								<div class="w-full bg-muted rounded-full h-6 overflow-hidden">
+								<div class="w-full bg-muted rounded-full h-7 overflow-hidden">
 									<div
-										class="h-full bg-primary rounded-full flex items-center justify-end pr-2 transition-all"
-										style="width: {pct}%"
+										class="h-full bg-primary rounded-full flex items-center px-2.5 transition-all"
+										style="width: {Math.max(pct, 2)}%"
 									>
-										{#if pct > 10}
+										{#if pct > 8}
 											<span class="text-xs text-primary-foreground font-medium">{pct}%</span>
 										{/if}
 									</div>
 								</div>
 							</div>
+							{#if i < results.length - 1 && dropoffPct > 0}
+								<div class="flex items-center gap-2 pl-4 -my-1">
+									<svg class="text-muted-foreground/50" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+									<span class="text-[10px] text-muted-foreground">{dropoffPct}% dropped off</span>
+								</div>
+							{/if}
 						{/each}
 					</div>
 				{/if}
