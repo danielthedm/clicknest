@@ -33,9 +33,9 @@ func ScoreMentionRelevance(ctx context.Context, cfg *storage.LLMConfig, mentions
 		return nil, nil
 	}
 
-	// Truncate to avoid blowing up context windows.
-	if len(mentions) > 25 {
-		mentions = mentions[:25]
+	// Keep batches small to avoid truncated LLM responses.
+	if len(mentions) > 10 {
+		mentions = mentions[:10]
 	}
 
 	systemMsg := `You are a lead qualification expert. You will receive a list of Reddit posts and information about a product and its ideal customer profile. Score each post's relevance on a scale of 0.0 to 1.0:
@@ -103,8 +103,8 @@ func buildRelevancePrompt(mentions []MentionForScoring, productDesc, icpTraits s
 			fmt.Fprintf(&b, "Title: %s\n", m.Title)
 		}
 		content := m.Content
-		if len(content) > 500 {
-			content = content[:500] + "..."
+		if len(content) > 300 {
+			content = content[:300] + "..."
 		}
 		if content != "" {
 			fmt.Fprintf(&b, "Content: %s\n", content)
