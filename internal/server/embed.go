@@ -30,7 +30,17 @@ func SPAHandler(fsys fs.FS) http.Handler {
 	if host := os.Getenv("CLICKNEST_ANALYTICS_HOST"); host != "" {
 		if key := os.Getenv("CLICKNEST_ANALYTICS_KEY"); key != "" {
 			tag := fmt.Sprintf(`<script src="%s/sdk.js" data-api-key="%s" data-host="%s" defer></script>`, host, key, host)
-			indexHTML = bytes.Replace(indexHTML, []byte("</head>"), []byte(tag+"\n</head>"), 1)
+			// Auto-identify the logged-in user for analytics.
+			identify := `<script>
+document.addEventListener('DOMContentLoaded',function(){
+  fetch('/api/v1/auth/me',{credentials:'same-origin'}).then(function(r){
+    if(r.ok)return r.json();
+  }).then(function(d){
+    if(d&&d.email&&window.clicknest)window.clicknest.identify(d.email);
+  }).catch(function(){});
+});
+</script>`
+			indexHTML = bytes.Replace(indexHTML, []byte("</head>"), []byte(tag+"\n"+identify+"\n</head>"), 1)
 		}
 	}
 
