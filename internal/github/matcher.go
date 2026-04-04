@@ -36,13 +36,34 @@ func NewMatcher(meta *storage.SQLite) *Matcher {
 }
 
 // MatchAndFetch finds the best source file for a DOM element, then fetches its content
-// from GitHub. Satisfies ai.SourceMatcher interface.
-func (m *Matcher) MatchAndFetch(ctx context.Context, projectID, elementID, elementClasses, parentPath string) (sourceCode, sourceFile string, ok bool) {
+// from GitHub. Uses two strategies:
+// 1. URL path → route file mapping (works for SvelteKit, Next.js, etc.)
+// 2. CSS selector matching (works for React apps with semantic IDs/classes)
+// Satisfies ai.SourceMatcher interface.
+func (m *Matcher) MatchAndFetch(ctx context.Context, projectID, elementID, elementClasses, parentPath, urlPath string) (sourceCode, sourceFile string, ok bool) {
+
+	// Strategy 1: Try route-based matching (URL path → component file).
+	if urlPath != "" {
+		match, err := m.MatchByRoute(ctx, projectID, urlPath)
+		if err == nil && match != nil {
+			code, file, found := m.fetchSource(ctx, projectID, match)
+			if found {
+				return code, file, true
+			}
+		}
+	}
+
+	// Strategy 2: Fall back to selector-based matching.
 	match, err := m.Match(ctx, projectID, elementID, elementClasses, parentPath)
 	if err != nil || match == nil {
 		return "", "", false
 	}
 
+	return m.fetchSource(ctx, projectID, match)
+}
+
+// fetchSource retrieves the source code for a matched file from GitHub.
+func (m *Matcher) fetchSource(ctx context.Context, projectID string, match *SourceMatch) (sourceCode, sourceFile string, ok bool) {
 	conn, err := m.meta.GetGitHubConnection(ctx, projectID)
 	if err != nil {
 		return "", "", false
@@ -54,7 +75,6 @@ func (m *Matcher) MatchAndFetch(ctx context.Context, projectID, elementID, eleme
 		return "", "", false
 	}
 
-	// Truncate to avoid blowing up the LLM context.
 	if len(content) > 3000 {
 		content = content[:3000] + "\n// ... truncated"
 	}
@@ -62,7 +82,147 @@ func (m *Matcher) MatchAndFetch(ctx context.Context, projectID, elementID, eleme
 	return content, match.FilePath, true
 }
 
-// Match finds the best source file for the given DOM context.
+// MatchByRoute finds the source file that corresponds to a URL path using
+// framework routing conventions (SvelteKit, Next.js, Nuxt, etc.).
+func (m *Matcher) MatchByRoute(ctx context.Context, projectID, urlPath string) (*SourceMatch, error) {
+	// Clean the URL path.
+	urlPath = strings.TrimRight(urlPath, "/")
+	if urlPath == "" {
+		urlPath = "/"
+	}
+
+	rows, err := m.meta.DB().QueryContext(ctx,
+		`SELECT file_path, component_name FROM source_index WHERE project_id = ?`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bestMatch *SourceMatch
+	var bestScore int
+
+	for rows.Next() {
+		var filePath string
+		var componentName sql.NullString
+		if err := rows.Scan(&filePath, &componentName); err != nil {
+			continue
+		}
+
+		score := routeMatchScore(filePath, urlPath)
+		if score > bestScore {
+			bestScore = score
+			name := ""
+			if componentName.Valid {
+				name = componentName.String
+			}
+			bestMatch = &SourceMatch{
+				FilePath:      filePath,
+				ComponentName: name,
+				Score:         float64(score),
+			}
+		}
+	}
+
+	if bestMatch == nil || bestScore < 1 {
+		return nil, nil
+	}
+	return bestMatch, nil
+}
+
+// routeMatchScore computes how well a source file path matches a URL route.
+// Higher score = better match.
+func routeMatchScore(filePath, urlPath string) int {
+	lower := strings.ToLower(filePath)
+
+	// SvelteKit: src/routes/people/sessions/+page.svelte → /people/sessions
+	if strings.Contains(lower, "+page.svelte") || strings.Contains(lower, "+page.ts") || strings.Contains(lower, "+page.server") {
+		routePath := svelteKitRoute(filePath)
+		if routePath == urlPath {
+			return 10
+		}
+		// Partial match (prefix).
+		if urlPath != "/" && strings.HasPrefix(urlPath, routePath) {
+			return 5
+		}
+	}
+
+	// Next.js: app/people/sessions/page.tsx or pages/people/sessions.tsx
+	if strings.Contains(lower, "/page.tsx") || strings.Contains(lower, "/page.jsx") || strings.Contains(lower, "/page.ts") {
+		routePath := nextJSRoute(filePath)
+		if routePath == urlPath {
+			return 10
+		}
+		if urlPath != "/" && strings.HasPrefix(urlPath, routePath) {
+			return 5
+		}
+	}
+
+	// pages/ directory (Next.js pages router, Nuxt)
+	if strings.Contains(lower, "pages/") && !strings.Contains(lower, "+page") {
+		routePath := pagesRoute(filePath)
+		if routePath == urlPath {
+			return 10
+		}
+	}
+
+	return 0
+}
+
+// svelteKitRoute extracts the URL path from a SvelteKit route file path.
+// e.g. "web/src/routes/people/sessions/+page.svelte" → "/people/sessions"
+// e.g. "src/routes/analytics/events/+page.svelte" → "/analytics/events"
+func svelteKitRoute(filePath string) string {
+	// Find "routes/" in the path.
+	idx := strings.Index(strings.ToLower(filePath), "routes/")
+	if idx < 0 {
+		return ""
+	}
+	routePart := filePath[idx+7:] // after "routes/"
+
+	// Remove the filename (+page.svelte, +page.ts, etc.)
+	dir := path.Dir(routePart)
+	if dir == "." {
+		return "/"
+	}
+	return "/" + dir
+}
+
+// nextJSRoute extracts URL path from Next.js app router file path.
+// e.g. "app/people/sessions/page.tsx" → "/people/sessions"
+func nextJSRoute(filePath string) string {
+	idx := strings.Index(strings.ToLower(filePath), "app/")
+	if idx < 0 {
+		return ""
+	}
+	routePart := filePath[idx+4:]
+	dir := path.Dir(routePart)
+	if dir == "." {
+		return "/"
+	}
+	return "/" + dir
+}
+
+// pagesRoute extracts URL path from pages-based routing.
+// e.g. "pages/people/sessions.tsx" → "/people/sessions"
+func pagesRoute(filePath string) string {
+	idx := strings.Index(strings.ToLower(filePath), "pages/")
+	if idx < 0 {
+		return ""
+	}
+	routePart := filePath[idx+6:]
+	ext := path.Ext(routePart)
+	routePart = strings.TrimSuffix(routePart, ext)
+	if strings.HasSuffix(routePart, "/index") {
+		routePart = strings.TrimSuffix(routePart, "/index")
+	}
+	if routePart == "index" {
+		return "/"
+	}
+	return "/" + routePart
+}
+
+// Match finds the best source file for the given DOM context using selectors.
 func (m *Matcher) Match(ctx context.Context, projectID string, elementID, elementClasses, parentPath string) (*SourceMatch, error) {
 	rows, err := m.meta.DB().QueryContext(ctx,
 		`SELECT file_path, component_name, selectors FROM source_index WHERE project_id = ?`,
@@ -111,7 +271,6 @@ func (m *Matcher) MatchSourceFile(ctx context.Context, projectID, sourceURL stri
 		return nil, nil
 	}
 
-	// Parse filename from URL.
 	parsed, err := url.Parse(sourceURL)
 	if err != nil {
 		return nil, nil
@@ -121,7 +280,6 @@ func (m *Matcher) MatchSourceFile(ctx context.Context, projectID, sourceURL stri
 		return nil, nil
 	}
 
-	// Query all indexed files for this project.
 	rows, err := m.meta.DB().QueryContext(ctx,
 		`SELECT file_path FROM source_index WHERE project_id = ?`, projectID)
 	if err != nil {
@@ -136,7 +294,6 @@ func (m *Matcher) MatchSourceFile(ctx context.Context, projectID, sourceURL stri
 		if err := rows.Scan(&fp); err != nil {
 			continue
 		}
-		// Score by matching path suffix — longer suffix match = better score.
 		score := pathSuffixScore(fp, parsed.Path)
 		if score > bestScore {
 			bestScore = score
@@ -148,7 +305,6 @@ func (m *Matcher) MatchSourceFile(ctx context.Context, projectID, sourceURL stri
 		return nil, nil
 	}
 
-	// Look up GitHub connection to build URL.
 	conn, err := m.meta.GetGitHubConnection(ctx, projectID)
 	if err != nil {
 		return nil, nil
@@ -167,7 +323,6 @@ func (m *Matcher) MatchSourceFile(ctx context.Context, projectID, sourceURL stri
 	}, nil
 }
 
-// pathSuffixScore computes how many path segments of candidate match the suffix of sourceURL.
 func pathSuffixScore(candidate, sourcePath string) int {
 	cParts := strings.Split(candidate, "/")
 	sParts := strings.Split(sourcePath, "/")

@@ -10,7 +10,7 @@ import (
 
 // SourceMatcher finds source code for DOM elements (optional, used when GitHub is connected).
 type SourceMatcher interface {
-	MatchAndFetch(ctx context.Context, projectID, elementID, elementClasses, parentPath string) (sourceCode, sourceFile string, ok bool)
+	MatchAndFetch(ctx context.Context, projectID, elementID, elementClasses, parentPath, urlPath string) (sourceCode, sourceFile string, ok bool)
 }
 
 // NamingJob represents a pending event naming task.
@@ -158,7 +158,7 @@ func (n *Namer) worker() {
 		// Enrich with source code if GitHub is connected.
 		req := job.Request
 		if matcher != nil {
-			if code, file, ok := matcher.MatchAndFetch(ctx, job.ProjectID, req.ElementID, req.ElementClasses, req.ParentPath); ok {
+			if code, file, ok := matcher.MatchAndFetch(ctx, job.ProjectID, req.ElementID, req.ElementClasses, req.ParentPath, req.URLPath); ok {
 				req.SourceCode = code
 				req.SourceFile = file
 			}
