@@ -1023,8 +1023,14 @@ func (s *Server) githubOAuthCallbackHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Strip slug prefix if present (cloud mode routes through control plane proxy).
+	lookupState := state
+	if parts := strings.SplitN(state, "--", 2); len(parts) == 2 {
+		lookupState = parts[1]
+	}
+
 	// Validate state and get project ID.
-	projectID, err := s.meta.ValidateOAuthState(r.Context(), state)
+	projectID, err := s.meta.ValidateOAuthState(r.Context(), lookupState)
 	if err != nil {
 		http.Error(w, "invalid or expired state", http.StatusBadRequest)
 		return
