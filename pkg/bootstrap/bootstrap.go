@@ -24,6 +24,7 @@ import (
 	"github.com/danielthedm/clicknest/internal/server"
 	"github.com/danielthedm/clicknest/internal/storage"
 	"github.com/danielthedm/clicknest/internal/telemetry"
+	analytics "github.com/danielthedm/clicknest/sdks/go"
 )
 
 // Config holds configuration for bootstrapping a ClickNest instance.
@@ -81,10 +82,11 @@ type Config struct {
 
 // App holds initialized ClickNest subsystems.
 type App struct {
-	Meta   *storage.SQLite
-	Events *storage.DuckDB
-	Server *server.Server
-	namer  *ai.Namer
+	Meta      *storage.SQLite
+	Events    *storage.DuckDB
+	Server    *server.Server
+	namer     *ai.Namer
+	analytics *analytics.Client
 }
 
 // Setup initializes all ClickNest subsystems and returns an App.
@@ -155,6 +157,23 @@ func Setup(cfg Config) *App {
 	ghClientID := os.Getenv("GITHUB_CLIENT_ID")
 	ghClientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
 
+	// Set up backend analytics (dogfooding) if configured.
+	var selfAnalytics *analytics.Client
+	if analyticsHost := os.Getenv("CLICKNEST_ANALYTICS_HOST"); analyticsHost != "" {
+		if analyticsKey := os.Getenv("CLICKNEST_ANALYTICS_KEY"); analyticsKey != "" {
+			selfAnalytics = analytics.New(analyticsKey, analyticsHost, 30*time.Second)
+			instanceID := os.Getenv("INSTANCE_ID")
+			if instanceID == "" {
+				instanceID = "self-hosted"
+			}
+			selfAnalytics.Capture("instance_started", instanceID, map[string]any{
+				"version":   cfg.Version,
+				"cloud_mode": cfg.CloudMode,
+			})
+			log.Println("Backend analytics enabled (dogfooding)")
+		}
+	}
+
 	// If this is a cloud instance with a control plane, set up the usage reporter
 	// to periodically flush event counts to the control plane for billing.
 	onEventIngested := cfg.OnEventIngested
@@ -168,6 +187,24 @@ func Setup(cfg Config) *App {
 			reporter.RecordEvents(count)
 			if origHook != nil {
 				origHook(ctx, projectID, count)
+			}
+		}
+	}
+
+	// Wrap OnEventIngested to also report to backend analytics.
+	if selfAnalytics != nil {
+		prevHook := onEventIngested
+		instanceID := os.Getenv("INSTANCE_ID")
+		if instanceID == "" {
+			instanceID = "self-hosted"
+		}
+		onEventIngested = func(ctx context.Context, projectID string, count int64) {
+			selfAnalytics.Capture("events_ingested", instanceID, map[string]any{
+				"project_id": projectID,
+				"count":      count,
+			})
+			if prevHook != nil {
+				prevHook(ctx, projectID, count)
 			}
 		}
 	}
@@ -216,10 +253,11 @@ func Setup(cfg Config) *App {
 	}
 
 	return &App{
-		Meta:   meta,
-		Events: events,
-		Server: srv,
-		namer:  namer,
+		Meta:      meta,
+		Events:    events,
+		Server:    srv,
+		namer:     namer,
+		analytics: selfAnalytics,
 	}
 }
 
@@ -247,6 +285,9 @@ func (a *App) Run() {
 
 // Close releases all resources held by the App.
 func (a *App) Close() {
+	if a.analytics != nil {
+		a.analytics.Shutdown()
+	}
 	a.namer.Close()
 	a.Meta.Close()
 	a.Events.Close()

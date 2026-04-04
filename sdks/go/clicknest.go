@@ -1,5 +1,5 @@
-// Package clicknest provides a Go SDK for server-side analytics.
-package clicknest
+// Package analytics provides a Go SDK for server-side ClickNest analytics.
+package analytics
 
 import (
 	"bytes"
