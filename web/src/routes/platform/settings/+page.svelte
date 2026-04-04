@@ -16,6 +16,7 @@
 	let llmBaseUrl = $state('');
 	let llmApiKeySet = $state(false); // true if a key is already saved
 	let llmApiKeyHint = $state(''); // masked key like "sk-ant-...a1b2"
+	let llmIsManaged = $state(false); // true when AI is provided by the platform
 	let saving = $state(false);
 	let saved = $state(false);
 
@@ -78,6 +79,7 @@
 				llmBaseUrl = llm.base_url || '';
 				llmApiKeySet = llm.api_key_set;
 				llmApiKeyHint = llm.api_key_hint || '';
+				llmIsManaged = llm.is_managed ?? false;
 			}
 
 			// Detect OAuth callback redirect.
@@ -391,7 +393,15 @@
 
 		<!-- LLM Configuration -->
 		<div class="border border-border rounded-lg p-5 bg-card">
-			<h3 class="text-sm font-medium mb-1">AI Event Naming</h3>
+			<h3 class="text-sm font-medium mb-1">AI</h3>
+			{#if llmIsManaged}
+				<p class="text-xs text-muted-foreground mb-4">AI is included with your plan and powers event naming, lead scoring, reply drafting, and subreddit suggestions.</p>
+				<div class="flex items-center gap-3 bg-muted/60 border border-border rounded-md px-3 py-2.5">
+					<span class="w-2 h-2 rounded-full bg-green-500 shrink-0"></span>
+					<p class="text-sm font-medium">AI Included</p>
+					<span class="text-xs text-green-600 font-medium ml-auto">Active</span>
+				</div>
+			{:else}
 			<p class="text-xs text-muted-foreground mb-4">Configure the LLM provider for auto-generating human-readable event names.</p>
 
 			<!-- Current config status -->
@@ -483,6 +493,7 @@
 					{/if}
 				</button>
 			</div>
+		{/if}
 		</div>
 	{/if}
 

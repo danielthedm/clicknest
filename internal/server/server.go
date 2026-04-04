@@ -666,6 +666,10 @@ func (s *Server) getLLMConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If the config comes from env defaults (cloud), mark it as managed
+	// so the frontend can hide the configuration form.
+	isManaged := os.Getenv("DEFAULT_LLM_API_KEY") != "" && cfg.APIKey != nil && *cfg.APIKey == os.Getenv("DEFAULT_LLM_API_KEY")
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"provider":     cfg.Provider,
@@ -673,6 +677,7 @@ func (s *Server) getLLMConfigHandler(w http.ResponseWriter, r *http.Request) {
 		"base_url":     baseURL,
 		"api_key_set":  apiKeySet,
 		"api_key_hint": apiKeyHint,
+		"is_managed":   isManaged,
 	})
 }
 
