@@ -8,6 +8,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/danielthedm/clicknest/internal/ai"
 	"github.com/danielthedm/clicknest/internal/storage"
 )
 
@@ -41,8 +42,16 @@ func NewMatcher(meta *storage.SQLite) *Matcher {
 // 2. CSS selector matching (works for React apps with semantic IDs/classes)
 // Satisfies ai.SourceMatcher interface.
 func (m *Matcher) MatchAndFetch(ctx context.Context, projectID, elementID, elementClasses, parentPath, urlPath string) (sourceCode, sourceFile string, ok bool) {
+	// Strategy 1: AI-powered file selection — send the file list to the LLM
+	// and let it pick the most relevant file based on all available context.
+	if match, err := m.MatchWithAI(ctx, projectID, elementID, elementClasses, parentPath, urlPath); err == nil && match != nil {
+		code, file, found := m.fetchSource(ctx, projectID, match)
+		if found {
+			return code, file, true
+		}
+	}
 
-	// Strategy 1: Try route-based matching (URL path → component file).
+	// Strategy 2: Try route-based matching (URL path → component file).
 	if urlPath != "" {
 		match, err := m.MatchByRoute(ctx, projectID, urlPath)
 		if err == nil && match != nil {
@@ -53,13 +62,100 @@ func (m *Matcher) MatchAndFetch(ctx context.Context, projectID, elementID, eleme
 		}
 	}
 
-	// Strategy 2: Fall back to selector-based matching.
+	// Strategy 3: Fall back to selector-based matching.
 	match, err := m.Match(ctx, projectID, elementID, elementClasses, parentPath)
 	if err != nil || match == nil {
 		return "", "", false
 	}
 
 	return m.fetchSource(ctx, projectID, match)
+}
+
+// MatchWithAI asks the LLM to pick the most relevant source file from the
+// indexed file list, given the DOM element context. This works for any
+// framework since the AI understands file naming conventions.
+func (m *Matcher) MatchWithAI(ctx context.Context, projectID, elementID, elementClasses, parentPath, urlPath string) (*SourceMatch, error) {
+	// Get LLM config.
+	cfg, err := m.meta.GetLLMConfig(ctx, projectID)
+	if err != nil || cfg == nil {
+		return nil, fmt.Errorf("no LLM config")
+	}
+
+	// Get all indexed file paths.
+	rows, err := m.meta.DB().QueryContext(ctx,
+		`SELECT file_path, component_name FROM source_index WHERE project_id = ?`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type indexedFile struct {
+		path string
+		name string
+	}
+	var files []indexedFile
+	for rows.Next() {
+		var fp string
+		var cn sql.NullString
+		if err := rows.Scan(&fp, &cn); err != nil {
+			continue
+		}
+		name := ""
+		if cn.Valid {
+			name = cn.String
+		}
+		files = append(files, indexedFile{path: fp, name: name})
+	}
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no indexed files")
+	}
+
+	// Build a compact file list for the prompt.
+	var fileList strings.Builder
+	for _, f := range files {
+		fileList.WriteString(f.path)
+		fileList.WriteString("\n")
+	}
+
+	prompt := fmt.Sprintf(`Given this UI element context, which source file is most likely to contain the component that renders this element?
+
+Element tag: %s
+Element ID: %s
+Element classes: %s
+Element text context: %s
+Page URL path: %s
+DOM path: %s
+
+SOURCE FILES IN THE REPO:
+%s
+Reply with ONLY the file path, nothing else. If no file is a good match, reply "none".`,
+		"", elementID, elementClasses, "", urlPath, parentPath, fileList.String())
+
+	raw, err := ai.ChatComplete(ctx, cfg, "You are a source code expert. Given a UI element's DOM context and a list of source files, identify which file contains the component that renders this element. Reply with only the file path.", prompt)
+	if err != nil {
+		return nil, err
+	}
+
+	result := strings.TrimSpace(raw)
+	result = strings.Trim(result, "`\"'")
+	if result == "" || result == "none" {
+		return nil, nil
+	}
+
+	// Find the matching file in our list.
+	for _, f := range files {
+		if f.path == result || strings.HasSuffix(f.path, result) || strings.HasSuffix(result, f.path) {
+			return &SourceMatch{
+				FilePath:      f.path,
+				ComponentName: f.name,
+				Score:         1.0,
+			}, nil
+		}
+	}
+
+	return nil, nil
 }
 
 // fetchSource retrieves the source code for a matched file from GitHub.

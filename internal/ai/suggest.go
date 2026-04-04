@@ -72,6 +72,11 @@ func buildSuggestPrompt(sequences []storage.EventSequence) string {
 }
 
 // chatComplete dispatches a chat completion request to the configured LLM provider.
+// ChatComplete sends a system+user message to the configured LLM provider.
+func ChatComplete(ctx context.Context, cfg *storage.LLMConfig, systemMsg, userMsg string) (string, error) {
+	return chatComplete(ctx, cfg, systemMsg, userMsg)
+}
+
 func chatComplete(ctx context.Context, cfg *storage.LLMConfig, systemMsg, userMsg string) (string, error) {
 	switch cfg.Provider {
 	case "openai":
