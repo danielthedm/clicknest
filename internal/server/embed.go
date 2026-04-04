@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"embed"
+	"fmt"
 	"io/fs"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -22,6 +25,14 @@ func SPAHandler(fsys fs.FS) http.Handler {
 
 	// Read index.html into memory so we can serve it with no-cache headers.
 	indexHTML, _ := fs.ReadFile(fsys, "index.html")
+
+	// Inject product analytics script when configured (dogfooding).
+	if host := os.Getenv("CLICKNEST_ANALYTICS_HOST"); host != "" {
+		if key := os.Getenv("CLICKNEST_ANALYTICS_KEY"); key != "" {
+			tag := fmt.Sprintf(`<script src="%s/sdk/clicknest.js" data-api-key="%s" data-host="%s" defer></script>`, host, key, host)
+			indexHTML = bytes.Replace(indexHTML, []byte("</head>"), []byte(tag+"\n</head>"), 1)
+		}
+	}
 
 	serveIndex := func(w http.ResponseWriter, r *http.Request) {
 		// Never cache index.html — it references content-hashed assets
