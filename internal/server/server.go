@@ -78,6 +78,27 @@ type Config struct {
 	// MaxConcurrentQueries is the maximum number of concurrent DuckDB analytics queries
 	// allowed per project. 0 means unlimited. Default applied in New() if unset.
 	MaxConcurrentQueries int
+
+	// Analytics, if set, receives server-side event captures for backend
+	// instrumentation (dogfooding). Nil disables analytics capture.
+	Analytics AnalyticsTracker
+}
+
+// AnalyticsTracker is an interface for capturing backend analytics events.
+type AnalyticsTracker interface {
+	Capture(event string, distinctID string, properties map[string]any)
+}
+
+// track sends a backend analytics event if analytics is configured.
+func (s *Server) track(event string, properties map[string]any) {
+	if s.config.Analytics == nil {
+		return
+	}
+	distinctID := s.config.InstanceID
+	if distinctID == "" {
+		distinctID = "self-hosted"
+	}
+	s.config.Analytics.Capture(event, distinctID, properties)
 }
 
 type Server struct {
@@ -1123,6 +1144,8 @@ func (s *Server) githubOAuthCallbackHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	s.track("github_connected", map[string]any{"project_id": projectID})
+
 	// Redirect to settings page.
 	http.Redirect(w, r, "/settings?github=connected", http.StatusTemporaryRedirect)
 }
@@ -2070,6 +2093,7 @@ func (s *Server) icpAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		ProfileCount:    len(profiles),
 	})
 
+	s.track("icp_analyzed", map[string]any{"project_id": project.ID, "profile_count": len(profiles)})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"analysis":    analysis,
@@ -2481,6 +2505,7 @@ func (s *Server) checkAlerts(ctx context.Context) {
 		if err := s.meta.UpdateAlertTriggered(ctx, a.ID, now); err != nil {
 			log.Printf("WARN alert checker: failed to update last_triggered_at: %v", err)
 		}
+		s.track("alert_triggered", map[string]any{"project_id": a.ProjectID, "alert_name": a.Name, "metric": a.Metric, "count": count})
 	}
 }
 
@@ -2694,6 +2719,7 @@ func (s *Server) publishCampaignHandler(w http.ResponseWriter, r *http.Request) 
 	})
 	_ = s.meta.UpdateCampaign(r.Context(), project.ID, campaignID, campaign.Name, "published", campaign.Content, campaign.Cost)
 
+	s.track("campaign_published", map[string]any{"project_id": project.ID, "campaign_id": campaignID, "publisher": body.PublisherName})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
@@ -3592,6 +3618,7 @@ func (s *Server) upsertSourceConfigHandler(w http.ResponseWriter, r *http.Reques
 		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
 		return
 	}
+	s.track("source_configured", map[string]any{"project_id": project.ID, "source_name": body.SourceName, "enabled": body.Enabled})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -3797,6 +3824,7 @@ func (s *Server) publishMentionReplyHandler(w http.ResponseWriter, r *http.Reque
 
 	_ = s.meta.UpdateMentionStatus(r.Context(), project.ID, m.ID, "replied")
 
+	s.track("mention_replied", map[string]any{"project_id": project.ID, "source_name": m.SourceName})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
@@ -3937,6 +3965,9 @@ func (s *Server) runSourceMonitor(ctx context.Context) {
 				})
 			}
 
+			if len(mentions) > 0 {
+				s.track("mentions_discovered", map[string]any{"project_id": proj.ID, "source_name": cfg.SourceName, "count": len(mentions)})
+			}
 			_ = s.meta.UpdateSourceConfigLastRun(ctx, proj.ID, cfg.SourceName, time.Now().UTC())
 		}
 	}

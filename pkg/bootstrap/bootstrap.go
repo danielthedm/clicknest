@@ -227,6 +227,7 @@ func Setup(cfg Config) *App {
 		RetentionDaysFn:    cfg.RetentionDaysFn,
 		RateLimitFn:        cfg.RateLimitFn,
 		OnEventIngested:    onEventIngested,
+		Analytics:          selfAnalytics,
 	}, events, meta, namer, syncer, matcher, cfg.Registry)
 
 	// Start anonymous telemetry if not opted out.
