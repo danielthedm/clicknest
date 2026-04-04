@@ -29,7 +29,7 @@ func SPAHandler(fsys fs.FS) http.Handler {
 	// Inject product analytics script when configured (dogfooding).
 	if host := os.Getenv("CLICKNEST_ANALYTICS_HOST"); host != "" {
 		if key := os.Getenv("CLICKNEST_ANALYTICS_KEY"); key != "" {
-			tag := fmt.Sprintf(`<script src="%s/sdk/clicknest.js" data-api-key="%s" data-host="%s" defer></script>`, host, key, host)
+			tag := fmt.Sprintf(`<script src="%s/sdk.js" data-api-key="%s" data-host="%s" defer></script>`, host, key, host)
 			indexHTML = bytes.Replace(indexHTML, []byte("</head>"), []byte(tag+"\n</head>"), 1)
 		}
 	}
