@@ -88,7 +88,7 @@ func (c *Client) Identify(distinctID, previousID string) {
 	}
 }
 
-// Flush sends all queued events.
+// Flush sends all queued events. Failed batches are re-queued for retry.
 func (c *Client) Flush() {
 	c.mu.Lock()
 	items := c.queue
@@ -105,6 +105,7 @@ func (c *Client) Flush() {
 		batches[item.DistinctID] = append(batches[item.DistinctID], item.Event)
 	}
 
+	var failed []queueItem
 	for did, events := range batches {
 		p := payload{
 			Events:     events,
@@ -125,9 +126,35 @@ func (c *Client) Flush() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
+			// Re-queue for retry on next flush.
+			for _, ev := range events {
+				failed = append(failed, queueItem{Event: ev, DistinctID: did})
+			}
 			continue
 		}
 		resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			for _, ev := range events {
+				failed = append(failed, queueItem{Event: ev, DistinctID: did})
+			}
+		}
+	}
+
+	// Re-queue failed events (cap at 500 to prevent unbounded growth).
+	if len(failed) > 0 {
+		c.mu.Lock()
+		total := len(failed) + len(c.queue)
+		if total > 500 {
+			// Drop oldest failed events to stay within cap.
+			drop := total - 500
+			if drop >= len(failed) {
+				failed = nil
+			} else {
+				failed = failed[drop:]
+			}
+		}
+		c.queue = append(failed, c.queue...)
+		c.mu.Unlock()
 	}
 }
 
