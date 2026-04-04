@@ -378,6 +378,9 @@
 								</td>
 								<td class="px-4 py-2.5 max-w-xs truncate {event.event_name ? 'font-medium' : 'text-muted-foreground'}">
 									{eventDisplayName(event)}{#if group.count > 1}<span class="ml-1.5 text-xs text-muted-foreground font-normal">x{group.count}</span>{/if}
+									{#if event.source_file}
+										<span class="ml-1.5 text-[10px] text-muted-foreground font-mono opacity-60">{event.source_file.split('/').pop()}</span>
+									{/if}
 								</td>
 								<td class="px-4 py-2.5 text-muted-foreground truncate max-w-[200px]">{event.url_path}</td>
 								<td class="px-4 py-2.5">

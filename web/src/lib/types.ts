@@ -23,6 +23,7 @@ export interface Event {
 	timestamp: string;
 	received_at: string;
 	properties?: Record<string, unknown>;
+	source_file?: string;
 }
 
 export interface TrendPoint {

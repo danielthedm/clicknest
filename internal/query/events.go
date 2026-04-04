@@ -62,15 +62,19 @@ func (h *Handler) EventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	nameCache, _ := h.meta.BatchGetEventNames(r.Context(), project.ID, fps)
 	for i := range events {
-		if events[i].EventName != nil {
+		en, ok := nameCache[events[i].Fingerprint]
+		if !ok {
 			continue
 		}
-		if en, ok := nameCache[events[i].Fingerprint]; ok {
+		if events[i].EventName == nil {
 			name := en.AIName
 			if en.UserName != nil && *en.UserName != "" {
 				name = *en.UserName
 			}
 			events[i].EventName = &name
+		}
+		if en.SourceFile != nil && *en.SourceFile != "" {
+			events[i].SourceFile = *en.SourceFile
 		}
 	}
 

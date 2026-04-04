@@ -36,6 +36,7 @@ type Event struct {
 	Timestamp     time.Time         `json:"timestamp"`
 	ReceivedAt    time.Time         `json:"received_at"`
 	Properties    map[string]any    `json:"properties,omitempty"`
+	SourceFile    string            `json:"source_file,omitempty"` // from naming cache, not stored in DuckDB
 }
 
 type EventFilter struct {
