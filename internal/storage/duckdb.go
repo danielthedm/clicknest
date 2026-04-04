@@ -1235,6 +1235,20 @@ func (d *DuckDB) Checkpoint(ctx context.Context) error {
 	return err
 }
 
+// MergeDistinctID retroactively updates all events that were recorded under
+// oldID so they are attributed to newID instead.  Returns the number of rows
+// affected.
+func (d *DuckDB) MergeDistinctID(ctx context.Context, projectID, oldID, newID string) (int64, error) {
+	result, err := d.db.ExecContext(ctx,
+		`UPDATE events SET distinct_id = ? WHERE project_id = ? AND distinct_id = ?`,
+		newID, projectID, oldID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (d *DuckDB) Close() error {
 	return d.db.Close()
 }

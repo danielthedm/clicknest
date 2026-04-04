@@ -1,3 +1,5 @@
+import { enqueue } from './batch';
+
 const DISTINCT_KEY = '_cn_distinct';
 
 let currentDistinctId: string | null = null;
@@ -31,11 +33,27 @@ export function getDistinctId(): string {
 }
 
 export function identify(distinctId: string): void {
+  const previousId = getDistinctId();
+
   currentDistinctId = distinctId;
   try {
     localStorage.setItem(DISTINCT_KEY, distinctId);
   } catch {
     // localStorage not available
+  }
+
+  // Emit a $identify event so the backend can link the anonymous ID
+  // to the newly identified user and backfill past events.
+  if (previousId && previousId !== distinctId) {
+    enqueue({
+      event_type: '$identify',
+      timestamp: Date.now(),
+      url: typeof window !== 'undefined' ? window.location.href : '',
+      url_path: typeof window !== 'undefined' ? window.location.pathname : '',
+      properties: {
+        previous_id: previousId,
+      },
+    });
   }
 }
 

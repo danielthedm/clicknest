@@ -2008,3 +2008,57 @@ func (s *SQLite) DeleteExperiment(ctx context.Context, projectID, id string) err
 	)
 	return err
 }
+
+// --- Identity Aliases ---
+
+// SetIdentityAlias upserts a mapping from an anonymous ID to an identified user ID.
+func (s *SQLite) SetIdentityAlias(ctx context.Context, projectID, anonymousID, identifiedID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO identity_aliases (project_id, anonymous_id, identified_id)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT (project_id, anonymous_id) DO UPDATE SET identified_id = excluded.identified_id`,
+		projectID, anonymousID, identifiedID,
+	)
+	return err
+}
+
+// ResolveIdentity looks up a distinct ID in the aliases table. If the given ID
+// is a known anonymous ID it returns the canonical identified ID; otherwise it
+// returns the input unchanged.
+func (s *SQLite) ResolveIdentity(ctx context.Context, projectID, distinctID string) (string, error) {
+	var identifiedID string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT identified_id FROM identity_aliases WHERE project_id = ? AND anonymous_id = ?`,
+		projectID, distinctID,
+	).Scan(&identifiedID)
+	if err == sql.ErrNoRows {
+		return distinctID, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return identifiedID, nil
+}
+
+// ListAliases returns all anonymous IDs that have been linked to the given
+// identified user ID.
+func (s *SQLite) ListAliases(ctx context.Context, projectID, identifiedID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT anonymous_id FROM identity_aliases WHERE project_id = ? AND identified_id = ? ORDER BY created_at`,
+		projectID, identifiedID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}

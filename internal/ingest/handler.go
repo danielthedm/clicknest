@@ -38,6 +38,7 @@ type IngestPayload struct {
 
 type Handler struct {
 	events *storage.DuckDB
+	meta   *storage.SQLite
 	namer  *ai.Namer
 
 	// OnIngested is called in a goroutine after events are successfully written.
@@ -46,8 +47,8 @@ type Handler struct {
 	OnIngested func(projectID string, count int64)
 }
 
-func NewHandler(events *storage.DuckDB, namer *ai.Namer) *Handler {
-	return &Handler{events: events, namer: namer}
+func NewHandler(events *storage.DuckDB, meta *storage.SQLite, namer *ai.Namer) *Handler {
+	return &Handler{events: events, meta: meta, namer: namer}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -75,8 +76,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	userAgent := r.Header.Get("User-Agent")
 
-	events := make([]storage.Event, len(payload.Events))
-	for i, e := range payload.Events {
+	// Process $identify events: record the alias and backfill historical events.
+	for _, e := range payload.Events {
+		if e.EventType != "$identify" {
+			continue
+		}
+		previousID, _ := e.Properties["previous_id"].(string)
+		if previousID == "" || previousID == payload.DistinctID {
+			continue
+		}
+		if h.meta != nil {
+			if err := h.meta.SetIdentityAlias(r.Context(), project.ID, previousID, payload.DistinctID); err != nil {
+				log.Printf("ERROR setting identity alias: %v", err)
+			} else {
+				merged, err := h.events.MergeDistinctID(r.Context(), project.ID, previousID, payload.DistinctID)
+				if err != nil {
+					log.Printf("ERROR merging distinct_id: %v", err)
+				} else if merged > 0 {
+					log.Printf("identity merge: project=%s old=%s new=%s events_updated=%d", project.ID, previousID, payload.DistinctID, merged)
+				}
+			}
+		}
+	}
+
+	// Resolve the distinct_id to its canonical (identified) form if an alias exists.
+	resolvedDistinctID := payload.DistinctID
+	if h.meta != nil && payload.DistinctID != "" {
+		if resolved, err := h.meta.ResolveIdentity(r.Context(), project.ID, payload.DistinctID); err != nil {
+			log.Printf("ERROR resolving identity: %v", err)
+		} else {
+			resolvedDistinctID = resolved
+		}
+	}
+
+	events := make([]storage.Event, 0, len(payload.Events))
+	for _, e := range payload.Events {
+		// Skip $identify meta-events — they are not stored as analytics events.
+		if e.EventType == "$identify" {
+			continue
+		}
+
 		fingerprint := ComputeFingerprint(
 			e.ElementTag, e.ElementID, e.ElementClasses, e.ParentPath, e.URLPath,
 		)
@@ -86,10 +125,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ts = time.Now().UTC()
 		}
 
-		events[i] = storage.Event{
+		events = append(events, storage.Event{
 			ProjectID:      project.ID,
 			SessionID:      payload.SessionID,
-			DistinctID:     payload.DistinctID,
+			DistinctID:     resolvedDistinctID,
 			EventType:      e.EventType,
 			Fingerprint:    fingerprint,
 			ElementTag:     e.ElementTag,
@@ -108,7 +147,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			UserAgent:      userAgent,
 			Timestamp:      ts,
 			Properties:     e.Properties,
-		}
+		})
+	}
+
+	if len(events) == 0 {
+		// All events were $identify — nothing to insert, but that's OK.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":   "ok",
+			"accepted": 0,
+		})
+		return
 	}
 
 	if err := h.events.InsertEvents(r.Context(), events); err != nil {
@@ -123,23 +173,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Submit naming jobs for interaction events (not pageviews).
 	if h.namer != nil {
-		for i, e := range payload.Events {
-			if e.EventType == "pageview" {
+		for _, ev := range events {
+			if ev.EventType == "pageview" {
 				continue
 			}
 			h.namer.Submit(r.Context(), ai.NamingJob{
 				ProjectID:   project.ID,
-				Fingerprint: events[i].Fingerprint,
+				Fingerprint: ev.Fingerprint,
 				Request: ai.NamingRequest{
-					ElementTag:     e.ElementTag,
-					ElementID:      e.ElementID,
-					ElementClasses: e.ElementClasses,
-					ElementText:    e.ElementText,
-					AriaLabel:      e.AriaLabel,
-					ParentPath:     e.ParentPath,
-					URL:            e.URL,
-					URLPath:        e.URLPath,
-					PageTitle:      e.PageTitle,
+					ElementTag:     ev.ElementTag,
+					ElementID:      ev.ElementID,
+					ElementClasses: ev.ElementClasses,
+					ElementText:    ev.ElementText,
+					AriaLabel:      ev.AriaLabel,
+					ParentPath:     ev.ParentPath,
+					URL:            ev.URL,
+					URLPath:        ev.URLPath,
+					PageTitle:      ev.PageTitle,
 				},
 			})
 		}

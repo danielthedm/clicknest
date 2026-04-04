@@ -121,7 +121,7 @@ func New(config Config, events *storage.DuckDB, meta *storage.SQLite, namer *ai.
 }
 
 func (s *Server) routes() {
-	ingestHandler := ingest.NewHandler(s.events, s.namer)
+	ingestHandler := ingest.NewHandler(s.events, s.meta, s.namer)
 	if s.config.OnEventIngested != nil {
 		fn := s.config.OnEventIngested
 		ingestHandler.OnIngested = func(projectID string, count int64) {
