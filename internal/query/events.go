@@ -75,13 +75,12 @@ func (h *Handler) EventsHandler(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		if events[i].EventName == nil {
-			name := en.AIName
-			if en.UserName != nil && *en.UserName != "" {
-				name = *en.UserName
-			}
-			events[i].EventName = &name
+		// Always prefer the cache (freshest) over the denormalized DuckDB name.
+		name := en.AIName
+		if en.UserName != nil && *en.UserName != "" {
+			name = *en.UserName
 		}
+		events[i].EventName = &name
 		if en.SourceFile != nil && *en.SourceFile != "" {
 			events[i].SourceFile = *en.SourceFile
 			if ghURLPrefix != "" {
