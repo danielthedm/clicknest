@@ -1030,8 +1030,10 @@ func (s *Server) githubOAuthCallbackHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Validate state and get project ID.
+	log.Printf("github oauth callback: state=%s lookupState=%s", state, lookupState)
 	projectID, err := s.meta.ValidateOAuthState(r.Context(), lookupState)
 	if err != nil {
+		log.Printf("github oauth callback: validation failed: %v", err)
 		http.Error(w, "invalid or expired state", http.StatusBadRequest)
 		return
 	}
