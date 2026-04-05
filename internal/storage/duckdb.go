@@ -469,15 +469,14 @@ func (d *DuckDB) QueryUsers(ctx context.Context, projectID string, limit, offset
 }
 
 // QueryFunnel runs a session-based funnel analysis with ordered steps.
+// All values are inlined into the SQL to avoid go-duckdb parameter binding issues.
 func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []FunnelStep, start, end time.Time) ([]FunnelResult, error) {
 	if len(steps) == 0 {
 		return nil, nil
 	}
 
 	var sb strings.Builder
-	args := []any{}
 
-	// Build CTEs for each step.
 	for i, step := range steps {
 		if i == 0 {
 			sb.WriteString("WITH ")
@@ -486,35 +485,26 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		}
 		sb.WriteString(fmt.Sprintf("step%d AS (\n", i+1))
 		if i == 0 {
-			sb.WriteString("  SELECT DISTINCT session_id, MIN(timestamp) as ts FROM events WHERE project_id = ?")
-			args = append(args, projectID)
+			sb.WriteString(fmt.Sprintf("  SELECT DISTINCT session_id, MIN(timestamp) as ts FROM events WHERE project_id = '%s'", sqlEsc(projectID)))
 		} else {
-			sb.WriteString(fmt.Sprintf("  SELECT DISTINCT e.session_id, MIN(e.timestamp) as ts FROM events e JOIN step%d s ON e.session_id = s.session_id WHERE e.project_id = ?", i))
-			args = append(args, projectID)
+			sb.WriteString(fmt.Sprintf("  SELECT DISTINCT e.session_id, MIN(e.timestamp) as ts FROM events e JOIN step%d s ON e.session_id = s.session_id WHERE e.project_id = '%s'", i, sqlEsc(projectID)))
 		}
-		sb.WriteString(" AND event_type = ?")
-		args = append(args, step.EventType)
-		// Match by fingerprint (most reliable), then url_path, then event_name.
+		sb.WriteString(fmt.Sprintf(" AND event_type = '%s'", sqlEsc(step.EventType)))
 		if step.Fingerprint != "" {
-			sb.WriteString(" AND fingerprint = ?")
-			args = append(args, step.Fingerprint)
+			sb.WriteString(fmt.Sprintf(" AND fingerprint = '%s'", sqlEsc(step.Fingerprint)))
 		} else if step.URLPath != "" {
-			sb.WriteString(" AND url_path = ?")
-			args = append(args, step.URLPath)
+			sb.WriteString(fmt.Sprintf(" AND url_path = '%s'", sqlEsc(step.URLPath)))
 		} else if step.EventName != "" {
-			sb.WriteString(" AND (event_name = ? OR url_path = ?)")
-			args = append(args, step.EventName, step.EventName)
+			sb.WriteString(fmt.Sprintf(" AND (event_name = '%s' OR url_path = '%s')", sqlEsc(step.EventName), sqlEsc(step.EventName)))
 		}
 		if !start.IsZero() {
-			sb.WriteString(" AND timestamp >= ?")
-			args = append(args, start)
+			sb.WriteString(fmt.Sprintf(" AND timestamp >= '%s'", start.Format(time.RFC3339)))
 		}
 		if !end.IsZero() {
-			sb.WriteString(" AND timestamp <= ?")
-			args = append(args, end)
+			sb.WriteString(fmt.Sprintf(" AND timestamp <= '%s'", end.Format(time.RFC3339)))
 		}
 		if i > 0 {
-			sb.WriteString(fmt.Sprintf(" AND e.timestamp > s.ts"))
+			sb.WriteString(" AND e.timestamp > s.ts")
 		}
 		sb.WriteString("\n  GROUP BY ")
 		if i == 0 {
@@ -525,7 +515,6 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		sb.WriteString("\n)\n")
 	}
 
-	// Build SELECT union — inline labels to avoid DuckDB parameter binding issues.
 	for i, step := range steps {
 		if i > 0 {
 			sb.WriteString("UNION ALL\n")
@@ -534,11 +523,10 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		if label == "" {
 			label = step.EventType
 		}
-		escapedLabel := strings.ReplaceAll(fmt.Sprintf("Step %d: %s", i+1, label), "'", "''")
-		sb.WriteString(fmt.Sprintf("SELECT '%s' as step, COUNT(*) as count FROM step%d\n", escapedLabel, i+1))
+		sb.WriteString(fmt.Sprintf("SELECT '%s' as step, COUNT(*) as count FROM step%d\n", sqlEsc(fmt.Sprintf("Step %d: %s", i+1, label)), i+1))
 	}
 
-	rows, err := d.db.QueryContext(ctx, sb.String(), args...)
+	rows, err := d.db.QueryContext(ctx, sb.String())
 	if err != nil {
 		return nil, fmt.Errorf("querying funnel: %w", err)
 	}
@@ -553,6 +541,11 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// sqlEsc escapes single quotes for safe SQL string interpolation.
+func sqlEsc(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 func (d *DuckDB) QueryRetention(ctx context.Context, projectID, interval string, periods int, start, end time.Time) ([]RetentionCohort, error) {
@@ -641,51 +634,39 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 	}
 
 	var sb strings.Builder
-	args := []any{}
 
 	// Cohorts CTE — first-seen date per session.
-	sb.WriteString(fmt.Sprintf("WITH cohorts AS (\n  SELECT session_id, CAST(date_trunc('%s', CAST(MIN(timestamp) AS TIMESTAMP)) AS VARCHAR) as cohort\n  FROM events WHERE project_id = ?", interval))
-	args = append(args, projectID)
+	sb.WriteString(fmt.Sprintf("WITH cohorts AS (\n  SELECT session_id, CAST(date_trunc('%s', CAST(MIN(timestamp) AS TIMESTAMP)) AS VARCHAR) as cohort\n  FROM events WHERE project_id = '%s'", interval, sqlEsc(projectID)))
 	if !start.IsZero() {
-		sb.WriteString(" AND timestamp >= ?")
-		args = append(args, start)
+		sb.WriteString(fmt.Sprintf(" AND timestamp >= '%s'", start.Format(time.RFC3339)))
 	}
 	if !end.IsZero() {
-		sb.WriteString(" AND timestamp <= ?")
-		args = append(args, end)
+		sb.WriteString(fmt.Sprintf(" AND timestamp <= '%s'", end.Format(time.RFC3339)))
 	}
 	sb.WriteString("\n  GROUP BY session_id\n)\n")
 
-	// Build step CTEs (same logic as QueryFunnel).
+	// Build step CTEs.
 	for i, step := range steps {
 		sb.WriteString(", ")
 		sb.WriteString(fmt.Sprintf("step%d AS (\n", i+1))
 		if i == 0 {
-			sb.WriteString("  SELECT DISTINCT session_id, MIN(timestamp) as ts FROM events WHERE project_id = ?")
-			args = append(args, projectID)
+			sb.WriteString(fmt.Sprintf("  SELECT DISTINCT session_id, MIN(timestamp) as ts FROM events WHERE project_id = '%s'", sqlEsc(projectID)))
 		} else {
-			sb.WriteString(fmt.Sprintf("  SELECT DISTINCT e.session_id, MIN(e.timestamp) as ts FROM events e JOIN step%d s ON e.session_id = s.session_id WHERE e.project_id = ?", i))
-			args = append(args, projectID)
+			sb.WriteString(fmt.Sprintf("  SELECT DISTINCT e.session_id, MIN(e.timestamp) as ts FROM events e JOIN step%d s ON e.session_id = s.session_id WHERE e.project_id = '%s'", i, sqlEsc(projectID)))
 		}
-		sb.WriteString(" AND event_type = ?")
-		args = append(args, step.EventType)
+		sb.WriteString(fmt.Sprintf(" AND event_type = '%s'", sqlEsc(step.EventType)))
 		if step.Fingerprint != "" {
-			sb.WriteString(" AND fingerprint = ?")
-			args = append(args, step.Fingerprint)
+			sb.WriteString(fmt.Sprintf(" AND fingerprint = '%s'", sqlEsc(step.Fingerprint)))
 		} else if step.URLPath != "" {
-			sb.WriteString(" AND url_path = ?")
-			args = append(args, step.URLPath)
+			sb.WriteString(fmt.Sprintf(" AND url_path = '%s'", sqlEsc(step.URLPath)))
 		} else if step.EventName != "" {
-			sb.WriteString(" AND (event_name = ? OR url_path = ?)")
-			args = append(args, step.EventName, step.EventName)
+			sb.WriteString(fmt.Sprintf(" AND (event_name = '%s' OR url_path = '%s')", sqlEsc(step.EventName), sqlEsc(step.EventName)))
 		}
 		if !start.IsZero() {
-			sb.WriteString(" AND timestamp >= ?")
-			args = append(args, start)
+			sb.WriteString(fmt.Sprintf(" AND timestamp >= '%s'", start.Format(time.RFC3339)))
 		}
 		if !end.IsZero() {
-			sb.WriteString(" AND timestamp <= ?")
-			args = append(args, end)
+			sb.WriteString(fmt.Sprintf(" AND timestamp <= '%s'", end.Format(time.RFC3339)))
 		}
 		if i > 0 {
 			sb.WriteString(" AND e.timestamp > s.ts")
@@ -699,7 +680,6 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 		sb.WriteString("\n)\n")
 	}
 
-	// Final SELECT: for each step, join with cohorts and group by cohort.
 	for i, step := range steps {
 		if i > 0 {
 			sb.WriteString("UNION ALL\n")
@@ -708,12 +688,11 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 		if label == "" {
 			label = step.EventType
 		}
-		sb.WriteString(fmt.Sprintf("SELECT c.cohort, ? as step, COUNT(*) as count FROM step%d s JOIN cohorts c ON s.session_id = c.session_id GROUP BY c.cohort\n", i+1))
-		args = append(args, fmt.Sprintf("Step %d: %s", i+1, label))
+		sb.WriteString(fmt.Sprintf("SELECT c.cohort, '%s' as step, COUNT(*) as count FROM step%d s JOIN cohorts c ON s.session_id = c.session_id GROUP BY c.cohort\n", sqlEsc(fmt.Sprintf("Step %d: %s", i+1, label)), i+1))
 	}
 	sb.WriteString("ORDER BY cohort, step")
 
-	rows, err := d.db.QueryContext(ctx, sb.String(), args...)
+	rows, err := d.db.QueryContext(ctx, sb.String())
 	if err != nil {
 		return nil, fmt.Errorf("querying funnel cohorts: %w", err)
 	}
