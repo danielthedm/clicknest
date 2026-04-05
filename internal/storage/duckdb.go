@@ -533,10 +533,7 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		args = append(args, fmt.Sprintf("Step %d: %s", i+1, label))
 	}
 
-	query := sb.String()
-	log.Printf("DEBUG funnel query: %s", query)
-	log.Printf("DEBUG funnel args (%d): %v", len(args), args)
-	rows, err := d.db.QueryContext(ctx, query, args...)
+	rows, err := d.db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying funnel: %w", err)
 	}
