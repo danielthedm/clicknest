@@ -94,6 +94,8 @@ export interface Funnel {
 export interface FunnelStep {
 	event_type: string;
 	event_name: string;
+	fingerprint?: string;
+	url_path?: string;
 }
 
 export interface FunnelResult {

@@ -348,8 +348,10 @@ type UserProfile struct {
 }
 
 type FunnelStep struct {
-	EventType string `json:"event_type"`
-	EventName string `json:"event_name"`
+	EventType   string `json:"event_type"`
+	EventName   string `json:"event_name"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	URLPath     string `json:"url_path,omitempty"`
 }
 
 type FunnelResult struct {
@@ -492,14 +494,16 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		}
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
-		if step.EventName != "" {
-			if step.EventType == "pageview" {
-				sb.WriteString(" AND (event_name = ? OR url_path = ? OR url_path = ?)")
-				args = append(args, step.EventName, step.EventName, "/"+strings.TrimLeft(step.EventName, "/"))
-			} else {
-				sb.WriteString(" AND event_name = ?")
-				args = append(args, step.EventName)
-			}
+		// Match by fingerprint (most reliable), then url_path, then event_name.
+		if step.Fingerprint != "" {
+			sb.WriteString(" AND fingerprint = ?")
+			args = append(args, step.Fingerprint)
+		} else if step.URLPath != "" {
+			sb.WriteString(" AND url_path = ?")
+			args = append(args, step.URLPath)
+		} else if step.EventName != "" {
+			sb.WriteString(" AND (event_name = ? OR url_path = ?)")
+			args = append(args, step.EventName, step.EventName)
 		}
 		if !start.IsZero() {
 			sb.WriteString(" AND timestamp >= ?")
@@ -665,14 +669,15 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 		}
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
-		if step.EventName != "" {
-			if step.EventType == "pageview" {
-				sb.WriteString(" AND (event_name = ? OR url_path = ? OR url_path = ?)")
-				args = append(args, step.EventName, step.EventName, "/"+strings.TrimLeft(step.EventName, "/"))
-			} else {
-				sb.WriteString(" AND event_name = ?")
-				args = append(args, step.EventName)
-			}
+		if step.Fingerprint != "" {
+			sb.WriteString(" AND fingerprint = ?")
+			args = append(args, step.Fingerprint)
+		} else if step.URLPath != "" {
+			sb.WriteString(" AND url_path = ?")
+			args = append(args, step.URLPath)
+		} else if step.EventName != "" {
+			sb.WriteString(" AND (event_name = ? OR url_path = ?)")
+			args = append(args, step.EventName, step.EventName)
 		}
 		if !start.IsZero() {
 			sb.WriteString(" AND timestamp >= ?")

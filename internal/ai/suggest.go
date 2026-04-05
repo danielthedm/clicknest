@@ -46,18 +46,17 @@ func SuggestFunnels(ctx context.Context, cfg *storage.LLMConfig, sequences []sto
 	systemMsg := `You are a senior product analytics consultant. Given event data, product context, and source code structure, design conversion funnels that measure meaningful business outcomes.
 
 Return ONLY valid JSON in this format:
-{"suggestions": [{"name": "Funnel Name", "description": "What this funnel measures and why it matters", "steps": [{"event_type": "pageview", "event_name": "optional name"}, ...]}]}
+{"suggestions": [{"name": "Funnel Name", "description": "What this funnel measures", "steps": [{"event_type": "pageview", "url_path": "/analytics/events", "event_name": "View Analytics Events"}, {"event_type": "click", "fingerprint": "abc123", "event_name": "Create Dashboard"}]}]}
 
 Rules:
-- Suggest 3-5 funnels ranging from basic to advanced
-- Each funnel must have 3-6 steps
-- Focus on BUSINESS-CRITICAL journeys: onboarding completion, feature adoption, upgrade paths, aha moments
-- Use the named events and source code routes to understand what the app actually does
+- Suggest 3-5 funnels, 3-6 steps each
+- For PAGEVIEW steps: use "url_path" (e.g. "/analytics/events") — this is the most reliable match
+- For CLICK/SUBMIT steps: use "fingerprint" from the named events list — this is the unique identifier for each UI element
+- "event_name" is just a human-readable label for display — the matching happens on fingerprint or url_path
 - event_type must be one of: pageview, click, submit, input, custom
-- event_name should use the AI-named event names when available
-- Include at least one funnel that measures the product's core value delivery
-- Include at least one funnel that measures activation (new user → first value moment)
-- Descriptions should explain WHY this funnel matters for the business, not just what it tracks`
+- Focus on business-critical journeys: onboarding, feature adoption, upgrade paths, aha moments
+- Include at least one funnel for core value delivery and one for activation
+- Descriptions should explain WHY this funnel matters for the business`
 
 	userMsg := buildSuggestPrompt(sequences, productDesc, namedEvents, sourceFiles)
 
@@ -104,10 +103,10 @@ func buildSuggestPrompt(sequences []storage.EventSequence, productDesc string, n
 		b.WriteString("\n")
 	}
 
-	// Show named events (capped to avoid blowing up context).
+	// Show named events with fingerprints for funnel step references.
 	if len(namedEvents) > 0 {
-		b.WriteString("NAMED EVENTS (AI-identified user interactions):\n")
-		cap := 30
+		b.WriteString("NAMED EVENTS (use fingerprint for click/submit funnel steps):\n")
+		cap := 40
 		if len(namedEvents) < cap {
 			cap = len(namedEvents)
 		}
@@ -116,7 +115,7 @@ func buildSuggestPrompt(sequences []storage.EventSequence, productDesc string, n
 			if en.UserName != nil && *en.UserName != "" {
 				name = *en.UserName
 			}
-			fmt.Fprintf(&b, "  - %s\n", name)
+			fmt.Fprintf(&b, "  - %s [fingerprint: %s]\n", name, en.Fingerprint)
 		}
 		b.WriteString("\n")
 	}
