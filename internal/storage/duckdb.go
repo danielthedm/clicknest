@@ -493,11 +493,12 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
 		if step.EventName != "" {
-			nameLower := strings.ToLower(step.EventName)
 			if step.EventType == "pageview" {
-				sb.WriteString(fmt.Sprintf(" AND (LOWER(COALESCE(event_name,'')) LIKE '%%%s%%' OR LOWER(url_path) LIKE '%%%s%%')", escapeLike(nameLower), escapeLike(nameLower)))
+				sb.WriteString(" AND (event_name = ? OR url_path = ? OR url_path = ?)")
+				args = append(args, step.EventName, step.EventName, "/"+strings.TrimLeft(step.EventName, "/"))
 			} else {
-				sb.WriteString(fmt.Sprintf(" AND LOWER(COALESCE(event_name,'')) LIKE '%%%s%%'", escapeLike(nameLower)))
+				sb.WriteString(" AND event_name = ?")
+				args = append(args, step.EventName)
 			}
 		}
 		if !start.IsZero() {
@@ -665,11 +666,12 @@ func (d *DuckDB) QueryFunnelCohorts(ctx context.Context, projectID string, steps
 		sb.WriteString(" AND event_type = ?")
 		args = append(args, step.EventType)
 		if step.EventName != "" {
-			nameLower := strings.ToLower(step.EventName)
 			if step.EventType == "pageview" {
-				sb.WriteString(fmt.Sprintf(" AND (LOWER(COALESCE(event_name,'')) LIKE '%%%s%%' OR LOWER(url_path) LIKE '%%%s%%')", escapeLike(nameLower), escapeLike(nameLower)))
+				sb.WriteString(" AND (event_name = ? OR url_path = ? OR url_path = ?)")
+				args = append(args, step.EventName, step.EventName, "/"+strings.TrimLeft(step.EventName, "/"))
 			} else {
-				sb.WriteString(fmt.Sprintf(" AND LOWER(COALESCE(event_name,'')) LIKE '%%%s%%'", escapeLike(nameLower)))
+				sb.WriteString(" AND event_name = ?")
+				args = append(args, step.EventName)
 			}
 		}
 		if !start.IsZero() {
