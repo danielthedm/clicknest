@@ -525,7 +525,7 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		sb.WriteString("\n)\n")
 	}
 
-	// Build SELECT union.
+	// Build SELECT union — inline labels to avoid DuckDB parameter binding issues.
 	for i, step := range steps {
 		if i > 0 {
 			sb.WriteString("UNION ALL\n")
@@ -534,8 +534,8 @@ func (d *DuckDB) QueryFunnel(ctx context.Context, projectID string, steps []Funn
 		if label == "" {
 			label = step.EventType
 		}
-		sb.WriteString(fmt.Sprintf("SELECT ? as step, COUNT(*) as count FROM step%d\n", i+1))
-		args = append(args, fmt.Sprintf("Step %d: %s", i+1, label))
+		escapedLabel := strings.ReplaceAll(fmt.Sprintf("Step %d: %s", i+1, label), "'", "''")
+		sb.WriteString(fmt.Sprintf("SELECT '%s' as step, COUNT(*) as count FROM step%d\n", escapedLabel, i+1))
 	}
 
 	rows, err := d.db.QueryContext(ctx, sb.String(), args...)
